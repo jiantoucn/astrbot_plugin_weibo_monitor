@@ -338,83 +338,84 @@ class WeiboMonitor(Star):
         :param force_fetch: 是否强制获取最新一条（不比较 last_id）
         :return: 包含新微博信息的列表
         """
-        cards = await self._fetch_mblogs(uid)
-        if not cards:
-            return []
+        try:
+            cards = await self._fetch_mblogs(uid)
+            if not cards:
+                return []
 
-        valid_mblogs = self._filter_top_posts(cards)
-        if not valid_mblogs:
-            return []
+            valid_mblogs = self._filter_top_posts(cards)
+            if not valid_mblogs:
+                return []
 
-        # 获取上次记录的微博 ID
-        last_id_key = f"last_id_{uid}"
-        last_id_str = await self.get_kv_data(last_id_key, "0")
-        last_id = int(last_id_str)
-        
-        username = (valid_mblogs[0].get("user") or {}).get("screen_name", "未知用户")
-
-        # 1. 如果是全新监控（last_id == 0）或者是本会话的首次检查（且非强制触发）
-        # 我们只同步最新 ID 而不推送，避免启动或重载时的“消息轰炸”
-        if not force_fetch and (last_id == 0 or uid not in self.session_initialized_uids):
-            latest_id = int(valid_mblogs[0]["id"])
-            await self.put_kv_data(last_id_key, str(latest_id))
-            self.session_initialized_uids.add(uid)
-            if last_id == 0:
-                logger.info(f"WeiboMonitor: 已初始化全新监控 UID {uid} ({username})，起始 ID: {latest_id}")
-            else:
-                logger.info(f"WeiboMonitor: 已同步会话初始状态，UID {uid} ({username})，当前最新 ID: {latest_id}")
-            return []
-        
-        # 标记该 UID 已在本会话中完成过初始化/同步
-        self.session_initialized_uids.add(uid)
-
-        # 处理博文比对与过滤
-        new_posts = []
-        filter_keywords = self.config.get("filter_keywords", [])
-        
-        for mblog in valid_mblogs:
-            current_id = int(mblog["id"])
-            text = self.clean_text(mblog.get("text", ""))
+            # 获取上次记录的微博 ID
+            last_id_key = f"last_id_{uid}"
+            last_id_str = await self.get_kv_data(last_id_key, "0")
+            last_id = int(last_id_str)
             
-            # 屏蔽词过滤
-            has_filter_keyword = False
-            for keyword in filter_keywords:
-                if keyword and keyword in text:
-                    has_filter_keyword = True
-                    logger.info(f"WeiboMonitor: 微博 {current_id} 包含屏蔽词 '{keyword}'，已跳过推送")
-                    break
-            
-            if has_filter_keyword:
-                if force_fetch:
-                    break
-                continue
+            username = (valid_mblogs[0].get("user") or {}).get("screen_name", "未知用户")
 
-            if force_fetch:
-                # 强制模式只取第一条
-                bid = mblog.get("bid")
-                link = f"https://weibo.com/{uid}/{bid}"
-                new_posts.append({"text": text, "link": link, "username": username})
-                break
-            
-            if current_id > last_id:
-                bid = mblog.get("bid")
-                link = f"https://weibo.com/{uid}/{bid}"
-                new_posts.append({"text": text, "link": link, "username": username})
-            else:
-                # 因为是从新到旧，一旦遇到不大于 last_id 的，后面的肯定也不大于
-                break
-
-        # 无论 new_posts 是否为空，只要有新博文（最新 ID > last_id），就更新状态
-        if not force_fetch and valid_mblogs:
-            latest_id = int(valid_mblogs[0]["id"])
-            if latest_id > last_id:
+            # 1. 如果是全新监控（last_id == 0）或者是本会话的首次检查（且非强制触发）
+            # 我们只同步最新 ID 而不推送，避免启动或重载时的“消息轰炸”
+            if not force_fetch and (last_id == 0 or uid not in self.session_initialized_uids):
+                latest_id = int(valid_mblogs[0]["id"])
                 await self.put_kv_data(last_id_key, str(latest_id))
+                self.session_initialized_uids.add(uid)
+                if last_id == 0:
+                    logger.info(f"WeiboMonitor: 已初始化全新监控 UID {uid} ({username})，起始 ID: {latest_id}")
+                else:
+                    logger.info(f"WeiboMonitor: 已同步会话初始状态，UID {uid} ({username})，当前最新 ID: {latest_id}")
+                return []
+            
+            # 标记该 UID 已在本会话中完成过初始化/同步
+            self.session_initialized_uids.add(uid)
 
-        if new_posts:
-            # 反转列表，确保按时间顺序（旧到新）推送
-            new_posts.reverse()
+            # 处理博文比对与过滤
+            new_posts = []
+            filter_keywords = self.config.get("filter_keywords", [])
+            
+            for mblog in valid_mblogs:
+                current_id = int(mblog["id"])
+                text = self.clean_text(mblog.get("text", ""))
+                
+                # 屏蔽词过滤
+                has_filter_keyword = False
+                for keyword in filter_keywords:
+                    if keyword and keyword in text:
+                        has_filter_keyword = True
+                        logger.info(f"WeiboMonitor: 微博 {current_id} 包含屏蔽词 '{keyword}'，已跳过推送")
+                        break
+                
+                if has_filter_keyword:
+                    if force_fetch:
+                        break
+                    continue
 
-        return new_posts
+                if force_fetch:
+                    # 强制模式只取第一条
+                    bid = mblog.get("bid")
+                    link = f"https://weibo.com/{uid}/{bid}"
+                    new_posts.append({"text": text, "link": link, "username": username})
+                    break
+                
+                if current_id > last_id:
+                    bid = mblog.get("bid")
+                    link = f"https://weibo.com/{uid}/{bid}"
+                    new_posts.append({"text": text, "link": link, "username": username})
+                else:
+                    # 因为是从新到旧，一旦遇到不大于 last_id 的，后面的肯定也不大于
+                    break
+
+            # 无论 new_posts 是否为空，只要有新博文（最新 ID > last_id），就更新状态
+            if not force_fetch and valid_mblogs:
+                latest_id = int(valid_mblogs[0]["id"])
+                if latest_id > last_id:
+                    await self.put_kv_data(last_id_key, str(latest_id))
+
+            if new_posts:
+                # 反转列表，确保按时间顺序（旧到新）推送
+                new_posts.reverse()
+
+            return new_posts
         except Exception as e:
             logger.error(f"WeiboMonitor: 检查 UID {uid} 时出错: {e}")
             return []
