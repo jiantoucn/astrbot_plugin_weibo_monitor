@@ -10,14 +10,15 @@ from astrbot.api import logger
 from bs4 import BeautifulSoup
 
 
-@register("astrbot_plugin_weibo_monitor", "Sayaka", "定时监控微博用户动态并推送到指定会话。", "v1.4.12", "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor")
+@register("astrbot_plugin_weibo_monitor", "Sayaka", "定时监控微博用户动态并推送到指定会话。", "v1.4.14", "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor")
 class WeiboMonitor(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
         self.config = config or {}
         self.monitor_task = None
-        self.client = httpx.AsyncClient(timeout=10)
+        self.client = httpx.AsyncClient(timeout=20) # 增加超时时间到 20s，提高稳定性
         self.running = True
+        self.session_initialized_uids = set() # 用于跟踪本会话已初始化的 UID
 
         # 确保数据目录存在
         self.data_dir = StarTools.get_data_dir()
@@ -350,15 +351,20 @@ class WeiboMonitor(Star):
             if not valid_mblogs:
                 return []
 
-            # 首次监控，记录最新 ID 但不推送
-            if last_id == 0:
+            # 1. 如果是全新监控（last_id == 0）或者是本会话的首次检查（且非强制触发）
+            # 我们只同步最新 ID 而不推送，避免启动或重载时的“消息轰炸”
+            if not force_fetch and (last_id == 0 or uid not in self.session_initialized_uids):
                 latest_id = int(valid_mblogs[0]["id"])
                 await self.put_kv_data(last_id_key, str(latest_id))
-                logger.info(
-                    f"WeiboMonitor: 已初始化 UID {uid} ({username}) 的最后一条微博 ID: {latest_id}"
-                )
-                if not force_fetch:
-                    return []
+                self.session_initialized_uids.add(uid)
+                if last_id == 0:
+                    logger.info(f"WeiboMonitor: 已初始化全新监控 UID {uid} ({username})，起始 ID: {latest_id}")
+                else:
+                    logger.info(f"WeiboMonitor: 已同步会话初始状态，UID {uid} ({username})，当前最新 ID: {latest_id}")
+                return []
+            
+            # 标记该 UID 已在本会话中完成过初始化/同步
+            self.session_initialized_uids.add(uid)
 
             # 遍历所有有效的微博，找出所有新的
             # 列表是从新到旧排列的
