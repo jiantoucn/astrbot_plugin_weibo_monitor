@@ -10,7 +10,7 @@ from astrbot.api import logger
 from bs4 import BeautifulSoup
 
 
-@register("weibo_monitor", "Sayaka", "定时监控微博用户动态并推送到指定会话", "v1.4.5")
+@register("weibo_monitor", "Sayaka", "定时监控微博用户动态并推送到指定会话", "v1.4.6", "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor")
 class WeiboMonitor(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)

@@ -2,4 +2,5 @@ name: weibo_monitor
 display_name: 微博监控助手
 desc: 定时监控微博用户动态并推送到指定会话
 author: Sayaka
-version: v1.4.5
+version: v1.4.6
+help_url: https://github.com/jiantoucn/astrbot_plugin_weibo_monitor/blob/main/README.md
