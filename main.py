@@ -10,7 +10,7 @@ from astrbot.api import logger
 from bs4 import BeautifulSoup
 
 
-@register("astrbot_plugin_weibo_monitor", "Sayaka", "定时监控微博用户动态并推送到指定会话。", "v1.4.11", "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor")
+@register("astrbot_plugin_weibo_monitor", "Sayaka", "定时监控微博用户动态并推送到指定会话。", "v1.4.12", "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor")
 class WeiboMonitor(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -322,7 +322,8 @@ class WeiboMonitor(Star):
 
             # 获取上次记录的微博 ID
             last_id_key = f"last_id_{uid}"
-            last_id = await self.get_kv_data(last_id_key, "0")
+            last_id_str = await self.get_kv_data(last_id_key, "0")
+            last_id = int(last_id_str)
 
             valid_mblogs = []
             username = "未知用户"
@@ -330,9 +331,18 @@ class WeiboMonitor(Star):
                 # card_type 9 为微博博文
                 if card.get("card_type") == 9 and "mblog" in card:
                     mblog = card["mblog"]
-                    # 跳过置顶微博
-                    if mblog.get("isTop"):
+                    
+                    # 极其严格的置顶过滤
+                    is_top = (
+                        mblog.get("isTop") or 
+                        mblog.get("is_top") or 
+                        card.get("is_top") or 
+                        mblog.get("top") or
+                        mblog.get("title", {}).get("text") == "置顶"
+                    )
+                    if is_top:
                         continue
+                        
                     valid_mblogs.append(mblog)
                     if username == "未知用户":
                         username = mblog.get("user", {}).get("screen_name", "未知用户")
@@ -340,29 +350,45 @@ class WeiboMonitor(Star):
             if not valid_mblogs:
                 return []
 
-            latest_mblog = valid_mblogs[0]
-            current_id = str(latest_mblog["id"])
-
-            # 首次监控，记录 ID 但不推送
-            if last_id == "0":
-                await self.put_kv_data(last_id_key, current_id)
+            # 首次监控，记录最新 ID 但不推送
+            if last_id == 0:
+                latest_id = int(valid_mblogs[0]["id"])
+                await self.put_kv_data(last_id_key, str(latest_id))
                 logger.info(
-                    f"WeiboMonitor: 已初始化 UID {uid} ({username}) 的最后一条微博 ID: {current_id}"
+                    f"WeiboMonitor: 已初始化 UID {uid} ({username}) 的最后一条微博 ID: {latest_id}"
                 )
                 if not force_fetch:
                     return []
 
-            # 如果当前 ID 大于上次记录的 ID，说明有更新
-            # 注意：微博 ID 通常是递增的字符串/长整型
-            if force_fetch or (
-                current_id != last_id and int(current_id) > int(last_id)
-            ):
-                text = self.clean_text(latest_mblog.get("text", ""))
-                bid = latest_mblog.get("bid")
-                link = f"https://weibo.com/{uid}/{bid}"
-                new_posts.append({"text": text, "link": link, "username": username})
+            # 遍历所有有效的微博，找出所有新的
+            # 列表是从新到旧排列的
+            for mblog in valid_mblogs:
+                current_id = int(mblog["id"])
+                
+                if force_fetch:
+                    # 强制模式只取第一条
+                    text = self.clean_text(mblog.get("text", ""))
+                    bid = mblog.get("bid")
+                    link = f"https://weibo.com/{uid}/{bid}"
+                    new_posts.append({"text": text, "link": link, "username": username})
+                    break
+                
+                if current_id > last_id:
+                    text = self.clean_text(mblog.get("text", ""))
+                    bid = mblog.get("bid")
+                    link = f"https://weibo.com/{uid}/{bid}"
+                    new_posts.append({"text": text, "link": link, "username": username})
+                else:
+                    # 因为是从新到旧，一旦遇到不大于 last_id 的，后面的肯定也不大于
+                    break
+
+            if new_posts:
+                # 更新 last_id 为这一批中最全/最新的 ID (即 valid_mblogs[0])
                 if not force_fetch:
-                    await self.put_kv_data(last_id_key, current_id)
+                    await self.put_kv_data(last_id_key, str(valid_mblogs[0]["id"]))
+                
+                # 反转列表，确保按时间顺序（旧到新）推送
+                new_posts.reverse()
 
             return new_posts
         except Exception as e:
