@@ -10,7 +10,7 @@ from astrbot.api import logger
 from bs4 import BeautifulSoup
 
 
-@register("weibo_monitor", "Sayaka", "定时监控微博用户动态并推送到指定会话", "v1.4.7", "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor")
+@register("astrbot_plugin_weibo_monitor", "Sayaka", "定时监控微博用户动态并推送到指定会话。", "v1.4.8", "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor")
 class WeiboMonitor(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -20,7 +20,7 @@ class WeiboMonitor(Star):
         self.running = True
 
         # 确保数据目录存在
-        self.data_dir = os.path.join("data", "weibo_monitor")
+        self.data_dir = os.path.join("data", "astrbot_plugin_weibo_monitor")
         if not os.path.exists(self.data_dir):
             os.makedirs(self.data_dir, exist_ok=True)
         self.data_file = os.path.join(self.data_dir, "monitor_data.json")
