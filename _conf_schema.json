@@ -11,11 +11,23 @@
     "default": 10,
     "description": "检查间隔（分钟）"
   },
+  "check_interval_jitter": {
+    "type": "int",
+    "default": 2,
+    "description": "检查间隔随机浮动（分钟）",
+    "hint": "实际检查间隔会在 [间隔-浮动, 间隔+浮动] 范围内随机选择。例如：间隔10，浮动2，则随机在 8-12 分钟内检查一次。"
+  },
   "request_interval": {
     "type": "int",
     "default": 5,
     "description": "账号请求间隔（秒）",
     "hint": "多个账号间抓取的间隔时间，避免请求过快被拦截"
+  },
+  "request_interval_jitter": {
+    "type": "int",
+    "default": 1,
+    "description": "请求间隔随机浮动（秒）",
+    "hint": "实际请求间隔会在 [间隔-浮动, 间隔+浮动] 范围内随机选择。设置为0则不使用随机性。"
   },
   "target_conversation_id": {
     "type": "list",
