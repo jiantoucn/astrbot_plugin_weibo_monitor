@@ -179,7 +179,7 @@ class WeiboMonitor(Star):
 
             yield event.plain_result(
                 f"✅ 成功导入 {count} 项配置！\n"
-                f"注意：部分配置（如检查间隔）可能需要重启插件后才能完全生效。"
+                f"注意：部分配置（如检查间隔）可能需要重启插件后才能完全生效。导入后请先刷新插件后台页面，否则配置无法显示。"
             )
         except Exception as e:
             logger.error(f"WeiboMonitor: 导入配置失败: {e}")
