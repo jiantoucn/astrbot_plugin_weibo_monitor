@@ -5,9 +5,14 @@ import os
 import json
 import base64
 import random
+import tempfile
+import sys
+import subprocess
+from pathlib import Path
 from typing import List, Optional, Tuple, Dict, Any
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.star import Context, Star, register, StarTools
+from astrbot.api.message_components import Image
 from astrbot.api import logger
 from bs4 import BeautifulSoup
 
@@ -49,7 +54,7 @@ class WeiboMonitor(Star):
             self.data_dir.mkdir(parents=True, exist_ok=True)
         self.data_file = self.data_dir / "monitor_data.json"
         
-        # 兼容旧路径迁移 (data/astrbot_plugin_weibo_monitor -> StarTools.get_data_dir())
+        # 兼容旧路径迁移
         old_data_file = os.path.join("data", "astrbot_plugin_weibo_monitor", "monitor_data.json")
         if not self.data_file.exists() and os.path.exists(old_data_file):
             try:
@@ -63,15 +68,39 @@ class WeiboMonitor(Star):
 
         # 启动后台监控任务
         self.monitor_task = asyncio.create_task(self.run_monitor())
+        # 启动 Playwright 自动安装任务
+        self.playwright_init_task = asyncio.create_task(self._init_playwright())
+
+    async def _init_playwright(self):
+        """异步安装 Playwright 及 Chromium，使用持久化路径"""
+        browser_dir = StarTools.get_data_dir() / "playwright_browsers"
+        if not browser_dir.exists():
+            browser_dir.mkdir(parents=True, exist_ok=True)
+        
+        # 设置持久化环境变量
+        os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(browser_dir)
+        
+        # 检查 playwright 库是否安装
+        try:
+            import playwright
+        except ImportError:
+            logger.info("WeiboMonitor: 未检测到 Playwright 运行库，开始自动安装...")
+            proc = await asyncio.create_subprocess_exec(sys.executable, "-m", "pip", "install", "playwright")
+            await proc.communicate()
+            
+        # 检查浏览器内核是否已下载 (通过检查目录是否为空)
+        if not any(browser_dir.iterdir()):
+            logger.info("WeiboMonitor: 正在初始化 Playwright Chromium 浏览器内核，首次下载可能需要几分钟，请耐心等待...")
+            proc = await asyncio.create_subprocess_exec(sys.executable, "-m", "playwright", "install", "chromium")
+            await proc.communicate()
+            logger.info("WeiboMonitor: Playwright 浏览器依赖安装完成！")
 
     def _load_data(self) -> dict:
-        """从文件加载持久化数据，损坏时自动备份"""
         if self.data_file.exists():
             try:
                 return json.loads(self.data_file.read_text(encoding="utf-8"))
             except Exception as e:
                 logger.error(f"WeiboMonitor: 加载数据文件失败: {e}")
-                # 自动备份损坏的文件
                 try:
                     backup_file = self.data_file.with_suffix(f".bak.{int(asyncio.get_event_loop().time())}")
                     self.data_file.rename(backup_file)
@@ -81,19 +110,15 @@ class WeiboMonitor(Star):
         return {}
 
     def _save_data(self):
-        """将持久化数据保存到文件（原子写入，避免数据损坏）"""
         try:
-            # 先写入临时文件，成功后再替换原文件，防止写入中断导致数据损坏
             temp_file = self.data_file.with_suffix(".tmp")
             temp_file.write_text(
                 json.dumps(self._data, ensure_ascii=False, indent=4), 
                 encoding="utf-8"
             )
-            # 原子替换
             temp_file.replace(self.data_file)
         except Exception as e:
             logger.error(f"WeiboMonitor: 保存数据文件失败: {e}")
-            # 清理临时文件
             try:
                 if temp_file.exists():
                     temp_file.unlink()
@@ -101,16 +126,13 @@ class WeiboMonitor(Star):
                 pass
 
     async def get_kv_data(self, key: str, default=None):
-        """获取持久化键值对"""
         return self._data.get(key, default)
 
     async def put_kv_data(self, key: str, value):
-        """设置并保存持久化键值对"""
         self._data[key] = value
         self._save_data()
 
     def get_headers(self, uid: str = "") -> Dict[str, str]:
-        """获取请求头"""
         cookie = self.config.get("weibo_cookie", "")
         headers = {
             "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/604.1",
@@ -142,7 +164,6 @@ class WeiboMonitor(Star):
         if isinstance(targets_raw, str):
             return [t.strip() for t in targets_raw.split(",") if t.strip()]
         
-        # 兼容处理列表中包含逗号分隔字符串的情况
         targets = []
         if isinstance(targets_raw, list):
             for item in targets_raw:
@@ -162,7 +183,6 @@ class WeiboMonitor(Star):
 
     @filter.command("weibo_export")
     async def weibo_export(self, event: AstrMessageEvent):
-        """导出当前插件配置"""
         try:
             config_json = json.dumps(self.config, ensure_ascii=False)
             config_b64 = base64.b64encode(config_json.encode("utf-8")).decode("utf-8")
@@ -176,13 +196,11 @@ class WeiboMonitor(Star):
 
     @filter.command("weibo_import")
     async def weibo_import(self, event: AstrMessageEvent, config_str: str = ""):
-        """从导出的字符串导入配置"""
         if not config_str:
             yield event.plain_result("❌ 请提供配置字符串。用法: /weibo_import <配置字符串>")
             return
 
         try:
-            # 兼容直接 JSON 或 Base64
             try:
                 decoded = base64.b64decode(config_str).decode("utf-8")
                 new_config = json.loads(decoded)
@@ -192,14 +210,11 @@ class WeiboMonitor(Star):
             if not isinstance(new_config, dict):
                 raise ValueError("配置格式不正确")
 
-            # 兼容性合并：保持当前版本已有的键，仅更新导入的键
-            # 即使未来增加了更多配置项，此导入逻辑依然稳健
             count = 0
             for key, value in new_config.items():
                 self.config[key] = value
                 count += 1
 
-            # 尝试调用框架的配置保存接口（如果支持）
             try:
                 if hasattr(self.context, "config_manager") and hasattr(self.context.config_manager, "save_config"):
                     self.context.config_manager.save_config()
@@ -216,7 +231,6 @@ class WeiboMonitor(Star):
 
     @filter.command("weibo_verify")
     async def weibo_verify(self, event: AstrMessageEvent):
-        """验证当前配置的 Cookie 是否有效"""
         cookie = self.config.get("weibo_cookie", "")
         if not cookie:
             yield event.plain_result("❌ 未配置 Cookie。")
@@ -253,7 +267,6 @@ class WeiboMonitor(Star):
 
     @filter.command("weibo_check")
     async def weibo_check(self, event: AstrMessageEvent):
-        """立即检查并发送列表中第一个账号的最新微博信息 (仅限第一个)"""
         urls = self._parse_urls(self.config.get("weibo_urls", []))
         if not urls:
             yield event.plain_result("❌ 未在插件设置中配置监控URL。")
@@ -261,7 +274,6 @@ class WeiboMonitor(Star):
             
         yield event.plain_result(f"🔍 正在检查首个微博账号的最新动态...")
         
-        # 只取第一个 URL
         url = urls[0]
         targets = self.get_targets()
         msg_format = self.message_format
@@ -279,34 +291,46 @@ class WeiboMonitor(Star):
                 weibo=post["text"],
                 link=post["link"],
             )
-            chain = MessageChain().message(content)
 
-            if not targets:
-                await self.context.send_message(event.unified_msg_origin, chain)
+            enable_screenshot = self.config.get("weibo_screenshot", True)
+            screenshot_path = await self._take_screenshot(post["link"]) if enable_screenshot else None
+
+            chain = MessageChain().message(content)
+            if screenshot_path:
+                try:
+                    # 修复：将截图对象直接追加到消息链列表中
+                    chain.chain.append(Image.fromFileSystem(screenshot_path))
+                except Exception as e:
+                    logger.warning(f"WeiboMonitor: 截图附加到消息链失败: {e}")
+
+            actual_targets = targets if targets else [event.unified_msg_origin]
+            sent_count = 0
+            for target in actual_targets:
+                try:
+                    await self.context.send_message(target, chain)
+                    sent_count += 1
+                except Exception as e:
+                    logger.error(f"WeiboMonitor: 推送到目标 {target} 时出错: {e}")
+
+            if screenshot_path:
+                try:
+                    os.unlink(screenshot_path)
+                except Exception:
+                    pass
+
+            if sent_count > 0:
+                yield event.plain_result(f"✅ {post.get('username')} 已成功发送最新动态。")
             else:
-                sent_count = 0
-                for target in targets:
-                    try:
-                        await self.context.send_message(target, chain)
-                        sent_count += 1
-                    except Exception as e:
-                        logger.error(f"WeiboMonitor: 推送到目标 {target} 时出错: {e}")
-                
-                if sent_count > 0:
-                    yield event.plain_result(f"✅ {post.get('username')} 已成功发送最新动态。")
-                else:
-                    yield event.plain_result(f"❌ {post.get('username')} 发送动态失败。")
+                yield event.plain_result(f"❌ {post.get('username')} 发送动态失败。")
         else:
             yield event.plain_result(f"ℹ️ UID {uid} 未获取到有效微博。")
 
     @filter.command("weibo_check_all")
     async def weibo_check_all(self, event: AstrMessageEvent):
-        """立即检查并发送列表中所有账号的最新微博信息"""
         urls = self._parse_urls(self.config.get("weibo_urls", []))
         targets = self.get_targets()
         msg_format = self.message_format
         
-        # 基础请求间隔和浮动
         base_req_interval = self.config.get("request_interval", DEFAULT_REQUEST_INTERVAL)
         req_jitter = self.config.get("request_interval_jitter", 0)
 
@@ -321,7 +345,6 @@ class WeiboMonitor(Star):
         results = []
         for i, url in enumerate(urls):
             if i > 0:
-                # 随机化请求间隔
                 actual_req_interval = max(1, random.randint(base_req_interval - req_jitter, base_req_interval + req_jitter))
                 await asyncio.sleep(actual_req_interval)
 
@@ -338,23 +361,37 @@ class WeiboMonitor(Star):
                     weibo=post["text"],
                     link=post["link"],
                 )
-                chain = MessageChain().message(content)
 
-                if not targets:
-                    await self.context.send_message(event.unified_msg_origin, chain)
+                enable_screenshot = self.config.get("weibo_screenshot", True)
+                screenshot_path = await self._take_screenshot(post["link"]) if enable_screenshot else None
+
+                chain = MessageChain().message(content)
+                if screenshot_path:
+                    try:
+                        # 修复：将截图对象直接追加到消息链列表中
+                        chain.chain.append(Image.fromFileSystem(screenshot_path))
+                    except Exception as e:
+                        logger.warning(f"WeiboMonitor: 截图附加到消息链失败: {e}")
+
+                actual_targets = targets if targets else [event.unified_msg_origin]
+                sent_count = 0
+                for target in actual_targets:
+                    try:
+                        await self.context.send_message(target, chain)
+                        sent_count += 1
+                    except Exception as e:
+                        logger.error(f"WeiboMonitor: 推送到目标 {target} 时出错: {e}")
+
+                if screenshot_path:
+                    try:
+                        os.unlink(screenshot_path)
+                    except Exception:
+                        pass
+
+                if sent_count > 0:
+                    results.append(f"✅ {post.get('username')} 已成功发送最新动态。")
                 else:
-                    sent_count = 0
-                    for target in targets:
-                        try:
-                            await self.context.send_message(target, chain)
-                            sent_count += 1
-                        except Exception as e:
-                            logger.error(f"WeiboMonitor: 推送到目标 {target} 时出错: {e}")
-                    
-                    if sent_count > 0:
-                        results.append(f"✅ {post.get('username')} 已成功发送最新动态。")
-                    else:
-                        results.append(f"❌ {post.get('username')} 发送动态失败。")
+                    results.append(f"❌ {post.get('username')} 发送动态失败。")
             else:
                 results.append(f"ℹ️ UID {uid} 未获取到有效微博。")
 
@@ -362,13 +399,11 @@ class WeiboMonitor(Star):
 
     @property
     def message_format(self) -> str:
-        """获取并格式化消息模板"""
         return self.config.get(
             "message_format", DEFAULT_MESSAGE_TEMPLATE
         ).replace("\\n", "\n")
 
     async def run_monitor(self):
-        """后台监控主循环"""
         logger.info("微博监控任务已启动")
         await asyncio.sleep(10)
 
@@ -376,12 +411,10 @@ class WeiboMonitor(Star):
             try:
                 urls = self._parse_urls(self.config.get("weibo_urls", []))
                 
-                # 检查间隔随机化
                 base_interval = max(1, self.config.get("check_interval", DEFAULT_CHECK_INTERVAL))
                 interval_jitter = self.config.get("check_interval_jitter", 0)
                 actual_interval = max(1, random.randint(base_interval - interval_jitter, base_interval + interval_jitter))
                 
-                # 请求间隔参数
                 base_req_interval = self.config.get("request_interval", DEFAULT_REQUEST_INTERVAL)
                 req_jitter = self.config.get("request_interval_jitter", 0)
                 
@@ -407,11 +440,9 @@ class WeiboMonitor(Star):
                 await asyncio.sleep(60)
 
     def _parse_urls(self, urls_raw: Any) -> List[str]:
-        """解析监控URL列表，支持字符串逗号分隔或列表格式"""
         if isinstance(urls_raw, str):
             return [u.strip() for u in urls_raw.split(",") if u.strip()]
         
-        # 兼容处理列表中包含逗号分隔字符串的情况
         urls = []
         if isinstance(urls_raw, list):
             for item in urls_raw:
@@ -424,11 +455,9 @@ class WeiboMonitor(Star):
 
     async def _process_monitor_cycle(self, urls: List[str], base_req_interval: int, req_jitter: int, 
                                    targets: List[str], msg_format: str):
-        """处理单个监控周期的所有URL检查"""
         for i, url in enumerate(urls):
             try:
                 if i > 0:
-                    # 随机化请求间隔
                     actual_req_interval = max(1, random.randint(base_req_interval - req_jitter, base_req_interval + req_jitter))
                     await asyncio.sleep(actual_req_interval)
 
@@ -443,15 +472,107 @@ class WeiboMonitor(Star):
             except Exception as e:
                 logger.error(f"WeiboMonitor: 检查URL {url} 时出错: {e}")
 
+    async def _take_screenshot(self, url: str) -> Optional[str]:
+        try:
+            from playwright.async_api import async_playwright
+        except ImportError:
+            logger.warning("WeiboMonitor: 未安装 playwright，无法截图。请等待后台自动安装任务完成。")
+            return None
+
+        screenshot_cfg: Dict[str, Any] = {}
+        try:
+            wa_data_dir = Path("data") / "plugin_data" / "astrbot_plugin_web_analyzer"
+            wa_cfg_file = wa_data_dir / "config.json"
+            if wa_cfg_file.exists():
+                screenshot_cfg = json.loads(wa_cfg_file.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+        width        = int(screenshot_cfg.get("screenshot_width")  or self.config.get("screenshot_width",  1280))
+        height       = int(screenshot_cfg.get("screenshot_height") or self.config.get("screenshot_height", 720))
+        quality      = int(screenshot_cfg.get("screenshot_quality") or self.config.get("screenshot_quality", 80))
+        wait_ms      = int(screenshot_cfg.get("screenshot_wait_time") or self.config.get("screenshot_wait_time", 2000))
+        full_page    = bool(screenshot_cfg.get("screenshot_full_page") or self.config.get("screenshot_full_page", False))
+        fmt          = str(screenshot_cfg.get("screenshot_format") or self.config.get("screenshot_format", "jpeg")).lower()
+        if fmt not in ("jpeg", "png"):
+            fmt = "jpeg"
+
+        tmp_file = tempfile.NamedTemporaryFile(suffix=f".{fmt}", delete=False)
+        tmp_path = tmp_file.name
+        tmp_file.close()
+
+        try:
+            async with async_playwright() as p:
+                launch_kwargs: Dict[str, Any] = {
+                    "args": ["--no-sandbox", "--disable-setuid-sandbox"],
+                }
+
+                browser = await p.chromium.launch(**launch_kwargs)
+                page = await browser.new_page(viewport={"width": width, "height": height})
+
+                cookie_str = self.config.get("weibo_cookie", "")
+                if cookie_str:
+                    cookies = []
+                    for part in cookie_str.split(";"):
+                        part = part.strip()
+                        if "=" in part:
+                            name, _, value = part.partition("=")
+                            cookies.append({
+                                "name": name.strip(),
+                                "value": value.strip(),
+                                "domain": ".weibo.com",
+                                "path": "/",
+                            })
+                    if cookies:
+                        await page.context.add_cookies(cookies)
+
+                await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                await page.wait_for_timeout(wait_ms)
+
+                shot_kwargs: Dict[str, Any] = {
+                    "path": tmp_path,
+                    "full_page": full_page,
+                    "type": fmt,
+                }
+                if fmt == "jpeg":
+                    shot_kwargs["quality"] = quality
+
+                await page.screenshot(**shot_kwargs)
+                await browser.close()
+
+            logger.info(f"WeiboMonitor: 截图成功 -> {tmp_path}")
+            return tmp_path
+
+        except Exception as e:
+            logger.error(f"WeiboMonitor: 截图失败 ({url}): {e}")
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+            return None
+
     async def _send_new_posts(self, new_posts: List[dict], targets: List[str], msg_format: str):
-        """发送新微博到指定目标"""
+        enable_screenshot = self.config.get("weibo_screenshot", True)
+
         for post in new_posts:
             content = msg_format.format(
                 name=post.get("username", "未知用户"),
                 weibo=post["text"],
                 link=post["link"],
             )
+
+            screenshot_path: Optional[str] = None
+            if enable_screenshot:
+                screenshot_path = await self._take_screenshot(post["link"])
+
             chain = MessageChain().message(content)
+            if screenshot_path:
+                try:
+                    # 修复：将截图对象直接追加到消息链列表中
+                    chain.chain.append(Image.fromFileSystem(screenshot_path))
+                except Exception as e:
+                    logger.warning(f"WeiboMonitor: 截图附加到消息链失败: {e}")
+
             sent_count = 0
             for target in targets:
                 try:
@@ -459,41 +580,35 @@ class WeiboMonitor(Star):
                     sent_count += 1
                 except Exception as e:
                     logger.error(f"WeiboMonitor: 推送到目标 {target} 时出错: {e}")
-            
+
+            if screenshot_path:
+                try:
+                    os.unlink(screenshot_path)
+                except Exception:
+                    pass
+
             if sent_count > 0:
                 logger.info(
                     f"WeiboMonitor: 已向 {sent_count}/{len(targets)} 个目标推送 {post.get('username')} 的更新"
                 )
 
     async def parse_uid(self, url: str) -> Optional[str]:
-        """
-        解析微博URL或用户名，提取UID。
-        支持:
-        1. 直接输入UID (如: 12345678)
-        2. 个人主页URL (如: https://m.weibo.cn/u/12345678)
-        3. 微博域名URL (如: https://weibo.com/u/12345678)
-        4. 用户名跳转URL (如: https://weibo.com/n/用户名)
-        """
         url = url.strip()
         if url.isdigit():
             return url
 
-        # 匹配 /u/UID 格式
         match = re.search(r"weibo\.(com|cn)/u/(\d+)", url)
         if match:
             return match.group(2)
 
-        # 匹配 /n/用户名 格式
         match_name = re.search(r"weibo\.(com|cn)/n/([^/?#]+)", url)
         if match_name:
             name = match_name.group(2)
             try:
-                # 请求跳转接口
                 resp = await self.client.get(
                     f"{WEIBO_MOBILE_BASE}/n/{name}",
                     headers=self.get_headers(),
                 )
-                # 从最终跳转的URL中提取UID
                 final_url = str(resp.url)
                 match_uid = re.search(r"/u/(\d+)", final_url)
                 if match_uid:
@@ -504,7 +619,6 @@ class WeiboMonitor(Star):
         return None
 
     async def _fetch_weibo_cards(self, uid: str) -> List[dict]:
-        """获取指定UID的微博卡片列表"""
         api_url = f"{WEIBO_API_BASE}?type=uid&value={uid}&containerid=107603{uid}"
         try:
             resp = await self.client.get(api_url, headers=self.get_headers(uid))
@@ -525,7 +639,6 @@ class WeiboMonitor(Star):
             return []
 
     def _extract_valid_mblogs(self, cards: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], str]:
-        """从卡片列表中提取有效的微博博文，并过滤置顶"""
         valid_mblogs: List[Dict[str, Any]] = []
         username = "未知用户"
         
@@ -534,7 +647,6 @@ class WeiboMonitor(Star):
                 continue
             if card.get("card_type") == 9 and isinstance(card.get("mblog"), dict):
                 mblog = card["mblog"]
-                # 严格的置顶过滤
                 is_top = any([
                     mblog.get("isTop"),
                     mblog.get("is_top"),
@@ -552,12 +664,6 @@ class WeiboMonitor(Star):
         return valid_mblogs, username
 
     async def check_weibo(self, uid: str, force_fetch: bool = False) -> List[Dict[str, Any]]:
-        """
-        检查指定UID的最新微博。
-        :param uid: 微博用户ID
-        :param force_fetch: 是否强制获取最新一条（不比较last_id）
-        :return: 包含新微博信息的列表
-        """
         try:
             cards = await self._fetch_weibo_cards(uid)
             if not cards:
@@ -571,22 +677,19 @@ class WeiboMonitor(Star):
             last_id_str = await self.get_kv_data(last_id_key, "0")
             last_id = int(last_id_str)
 
-            # 初始化检查：全新监控或会话首次检查
             if not force_fetch and (last_id == 0 or uid not in self.session_initialized_uids):
                 return await self._initialize_monitor(uid, username, valid_mblogs, last_id_key, last_id)
 
             self.session_initialized_uids.add(uid)
 
-            # 收集新微博
             new_posts = self._collect_new_posts(uid, valid_mblogs, last_id, 
                                               force_fetch, username)
 
-            # 更新最新ID
             if not force_fetch:
                 await self._update_last_id(valid_mblogs, last_id, last_id_key)
 
             if new_posts:
-                new_posts.reverse()  # 按时间从旧到新排列
+                new_posts.reverse()
 
             return new_posts
         except Exception as e:
@@ -596,7 +699,6 @@ class WeiboMonitor(Star):
     async def _initialize_monitor(self, uid: str, username: str, 
                                 valid_mblogs: List[Dict[str, Any]], 
                                 last_id_key: str, old_last_id: int) -> List[Dict[str, Any]]:
-        """初始化监控状态，记录起始ID"""
         latest_id_val = valid_mblogs[0].get("id")
         if latest_id_val:
             latest_id = int(latest_id_val)
@@ -612,7 +714,6 @@ class WeiboMonitor(Star):
     def _collect_new_posts(self, uid: str, valid_mblogs: List[Dict[str, Any]], 
                           last_id: int, force_fetch: bool, 
                           username: str) -> List[Dict[str, Any]]:
-        """收集新的微博帖子，应用屏蔽词过滤、原创/转发过滤"""
         new_posts: List[Dict[str, Any]] = []
         filter_keywords = self.config.get("filter_keywords", [])
         send_original = self.config.get("send_original", True)
@@ -625,11 +726,9 @@ class WeiboMonitor(Star):
                 
             current_id = int(current_id_val)
             
-            # 停止条件：检查到旧帖
             if not force_fetch and current_id <= last_id:
                 break
 
-            # 区分原创和转发
             is_forward = "retweeted_status" in mblog
             if is_forward and not send_forward:
                 logger.info(f"WeiboMonitor: 微博 {current_id} 是转发微博，已根据配置跳过推送")
@@ -640,7 +739,6 @@ class WeiboMonitor(Star):
 
             text = self.clean_text(mblog.get("text", ""))
             
-            # 屏蔽词过滤
             if self._has_filter_keyword(text, filter_keywords, current_id):
                 continue
 
@@ -651,13 +749,12 @@ class WeiboMonitor(Star):
             link = f"{WEIBO_WEB_BASE}/{uid}/{bid}"
             new_posts.append({"text": text, "link": link, "username": username})
 
-            if force_fetch:  # 强制获取模式只取第一条
+            if force_fetch:
                 break
 
         return new_posts
 
     def _has_filter_keyword(self, text: str, filter_keywords: List[str], post_id: int) -> bool:
-        """检查文本是否包含屏蔽词"""
         for keyword in filter_keywords:
             if keyword and keyword in text:
                 logger.info(f"WeiboMonitor: 微博 {post_id} 包含屏蔽词 '{keyword}'，已跳过推送")
@@ -666,7 +763,6 @@ class WeiboMonitor(Star):
 
     async def _update_last_id(self, valid_mblogs: List[Dict[str, Any]], 
                              last_id: int, last_id_key: str):
-        """更新记录的最新微博ID"""
         latest_id_val = valid_mblogs[0].get("id")
         if latest_id_val:
             latest_id = int(latest_id_val)
@@ -674,37 +770,30 @@ class WeiboMonitor(Star):
                 await self.put_kv_data(last_id_key, str(latest_id))
 
     def clean_text(self, text: str) -> str:
-        """清理微博正文中的HTML标签并处理换行"""
         if not text:
             return ""
         if not isinstance(text, str):
             return str(text)
             
         try:
-            # 移除"全文"链接
             text = re.sub(r'<a[^>]*>全文</a>', '', text)
             
             soup = BeautifulSoup(text, "html.parser")
             
-            # 处理图片：将alt文本替换为emoji
             for img in soup.find_all("img"):
                 alt = img.get("alt", "")
                 if alt:
                     img.replace_with(alt)
             
-            # 处理超链接：移除所有超链接格式，仅保留链接内的文本内容，提升阅读观感
             for a in soup.find_all("a"):
                 link_text = a.get_text()
                 a.replace_with(link_text)
             
-            # 将 <br> 标签替换为换行符
             for br in soup.find_all("br"):
                 br.replace_with("\n")
             
-            # 获取纯文本
             text = soup.get_text()
             
-            # 清理多余的空白字符
             text = re.sub(r'\n\s+', '\n', text)
             text = re.sub(r'\s+\n', '\n', text)
             text = re.sub(r'\n{3,}', '\n\n', text)
