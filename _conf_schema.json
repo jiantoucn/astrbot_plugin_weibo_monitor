@@ -55,6 +55,13 @@
     "description": "屏蔽词列表",
     "hint": "如果微博正文包含这些词，将不会被推送。例如: 推广, 广告"
   },
+  "whitelist_keywords": {
+    "type": "list",
+    "item_type": "string",
+    "default": [],
+    "description": "关键词白名单",
+    "hint": "只有微博正文包含这些关键词时才会推送。为空时不限制。"
+  },
   "send_original": {
     "type": "bool",
     "default": true,

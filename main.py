@@ -21,7 +21,7 @@ WEIBO_MOBILE_BASE = "https://m.weibo.cn"
 WEIBO_WEB_BASE = "https://weibo.com"
 
 
-@register("astrbot_plugin_weibo_monitor", "Sayaka", "定时监控微博用户动态并推送到指定会话。", "v1.8.1", "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor")
+@register("astrbot_plugin_weibo_monitor", "Sayaka", "定时监控微博用户动态并推送到指定会话。", "v1.9.0", "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor")
 class WeiboMonitor(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -273,29 +273,8 @@ class WeiboMonitor(Star):
 
         latest_posts = await self.check_weibo(uid, force_fetch=True)
         if latest_posts:
-            post = latest_posts[0]
-            content = msg_format.format(
-                name=post.get("username", "未知用户"),
-                weibo=post["text"],
-                link=post["link"],
-            )
-            chain = MessageChain().message(content)
-
-            if not targets:
-                await self.context.send_message(event.unified_msg_origin, chain)
-            else:
-                sent_count = 0
-                for target in targets:
-                    try:
-                        await self.context.send_message(target, chain)
-                        sent_count += 1
-                    except Exception as e:
-                        logger.error(f"WeiboMonitor: 推送到目标 {target} 时出错: {e}")
-                
-                if sent_count > 0:
-                    yield event.plain_result(f"✅ {post.get('username')} 已成功发送最新动态。")
-                else:
-                    yield event.plain_result(f"❌ {post.get('username')} 发送动态失败。")
+            await self._send_new_posts(latest_posts, targets, msg_format, event.unified_msg_origin)
+            yield event.plain_result(f"✅ {latest_posts[0].get('username')} 已发送最新动态。")
         else:
             yield event.plain_result(f"ℹ️ UID {uid} 未获取到有效微博。")
 
@@ -306,7 +285,6 @@ class WeiboMonitor(Star):
         targets = self.get_targets()
         msg_format = self.message_format
         
-        # 基础请求间隔和浮动
         base_req_interval = self.config.get("request_interval", DEFAULT_REQUEST_INTERVAL)
         req_jitter = self.config.get("request_interval_jitter", 0)
 
@@ -321,7 +299,6 @@ class WeiboMonitor(Star):
         results = []
         for i, url in enumerate(urls):
             if i > 0:
-                # 随机化请求间隔
                 actual_req_interval = max(1, random.randint(base_req_interval - req_jitter, base_req_interval + req_jitter))
                 await asyncio.sleep(actual_req_interval)
 
@@ -332,29 +309,8 @@ class WeiboMonitor(Star):
 
             latest_posts = await self.check_weibo(uid, force_fetch=True)
             if latest_posts:
-                post = latest_posts[0]
-                content = msg_format.format(
-                    name=post.get("username", "未知用户"),
-                    weibo=post["text"],
-                    link=post["link"],
-                )
-                chain = MessageChain().message(content)
-
-                if not targets:
-                    await self.context.send_message(event.unified_msg_origin, chain)
-                else:
-                    sent_count = 0
-                    for target in targets:
-                        try:
-                            await self.context.send_message(target, chain)
-                            sent_count += 1
-                        except Exception as e:
-                            logger.error(f"WeiboMonitor: 推送到目标 {target} 时出错: {e}")
-                    
-                    if sent_count > 0:
-                        results.append(f"✅ {post.get('username')} 已成功发送最新动态。")
-                    else:
-                        results.append(f"❌ {post.get('username')} 发送动态失败。")
+                await self._send_new_posts(latest_posts, targets, msg_format, event.unified_msg_origin)
+                results.append(f"✅ {latest_posts[0].get('username')} 已发送最新动态。")
             else:
                 results.append(f"ℹ️ UID {uid} 未获取到有效微博。")
 
@@ -428,7 +384,6 @@ class WeiboMonitor(Star):
         for i, url in enumerate(urls):
             try:
                 if i > 0:
-                    # 随机化请求间隔
                     actual_req_interval = max(1, random.randint(base_req_interval - req_jitter, base_req_interval + req_jitter))
                     await asyncio.sleep(actual_req_interval)
 
@@ -443,8 +398,12 @@ class WeiboMonitor(Star):
             except Exception as e:
                 logger.error(f"WeiboMonitor: 检查URL {url} 时出错: {e}")
 
-    async def _send_new_posts(self, new_posts: List[dict], targets: List[str], msg_format: str):
+    async def _send_new_posts(self, new_posts: List[dict], targets: List[str], msg_format: str, 
+                               fallback_target: str = None):
         """发送新微博到指定目标"""
+        if not targets and fallback_target:
+            targets = [fallback_target]
+        
         for post in new_posts:
             content = msg_format.format(
                 name=post.get("username", "未知用户"),
@@ -452,8 +411,15 @@ class WeiboMonitor(Star):
                 link=post["link"],
             )
             chain = MessageChain().message(content)
+            
+            send_targets = targets
+            
+            if not send_targets:
+                logger.debug(f"WeiboMonitor: 没有配置推送目标，跳过推送 {post.get('username')} 的微博")
+                continue
+                
             sent_count = 0
-            for target in targets:
+            for target in send_targets:
                 try:
                     await self.context.send_message(target, chain)
                     sent_count += 1
@@ -462,7 +428,7 @@ class WeiboMonitor(Star):
             
             if sent_count > 0:
                 logger.info(
-                    f"WeiboMonitor: 已向 {sent_count}/{len(targets)} 个目标推送 {post.get('username')} 的更新"
+                    f"WeiboMonitor: 已向 {sent_count}/{len(send_targets)} 个目标推送 {post.get('username')} 的更新"
                 )
 
     async def parse_uid(self, url: str) -> Optional[str]:
@@ -640,8 +606,13 @@ class WeiboMonitor(Star):
 
             text = self.clean_text(mblog.get("text", ""))
             
-            # 屏蔽词过滤
+            # 屏蔽词过滤（黑名单）
             if self._has_filter_keyword(text, filter_keywords, current_id):
+                continue
+            
+            # 白名单关键词过滤（只有包含白名单关键词才推送）
+            whitelist_keywords = self.config.get("whitelist_keywords", [])
+            if self._should_skip_by_whitelist(text, whitelist_keywords, current_id):
                 continue
 
             bid = mblog.get("bid")
@@ -663,6 +634,17 @@ class WeiboMonitor(Star):
                 logger.info(f"WeiboMonitor: 微博 {post_id} 包含屏蔽词 '{keyword}'，已跳过推送")
                 return True
         return False
+
+    def _should_skip_by_whitelist(self, text: str, whitelist_keywords: List[str], post_id: int) -> bool:
+        """检查文本是否应该被白名单过滤跳过（只有包含白名单关键词才允许推送）"""
+        if not whitelist_keywords:
+            return False
+        for keyword in whitelist_keywords:
+            if keyword and keyword in text:
+                logger.info(f"WeiboMonitor: 微博 {post_id} 包含白名单关键词 '{keyword}'，允许推送")
+                return False
+        logger.info(f"WeiboMonitor: 微博 {post_id} 不包含任何白名单关键词，已跳过推送")
+        return True
 
     async def _update_last_id(self, valid_mblogs: List[Dict[str, Any]], 
                              last_id: int, last_id_key: str):

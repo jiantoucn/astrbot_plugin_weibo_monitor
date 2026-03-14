@@ -1,5 +1,9 @@
 # 更新日志 (CHANGELOG)
 
+- **v1.9.0**:
+  - **新功能**: 增加关键词白名单功能（whitelist_keywords），只有微博正文包含白名单关键词时才推送。（[#3](https://github.com/jiantoucn/astrbot_plugin_weibo_monitor/issues/3)）
+  - **优化**: 完善过滤规则逻辑，先检查屏蔽词（黑名单），后检查白名单，确保用户体验流畅。
+
 - **v1.8.1**:
   - **优化**: 允许插件在未配置 Cookie 时启动，但会跳过监控循环并输出警告日志，方便用户进入后台进行配置。
 
