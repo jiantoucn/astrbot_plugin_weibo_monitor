@@ -21,7 +21,7 @@ WEIBO_MOBILE_BASE = "https://m.weibo.cn"
 WEIBO_WEB_BASE = "https://weibo.com"
 
 
-@register("astrbot_plugin_weibo_monitor", "Sayaka", "定时监控微博用户动态并推送到指定会话。", "v1.8.0", "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor")
+@register("astrbot_plugin_weibo_monitor", "Sayaka", "定时监控微博用户动态并推送到指定会话。", "v1.8.1", "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor")
 class WeiboMonitor(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -31,8 +31,7 @@ class WeiboMonitor(Star):
         # 检查Cookie是否配置
         cookie = self.config.get("weibo_cookie", "")
         if not cookie:
-            logger.error("WeiboMonitor: 未配置微博Cookie，插件无法正常工作！请在插件设置中填写weibo_cookie。")
-            raise ValueError("微博Cookie为必填项，请配置后再启动插件。")
+            logger.warning("WeiboMonitor: 未配置微博Cookie，插件无法正常工作！请在插件设置中填写weibo_cookie。")
         
         # 配置HTTP客户端，添加重试和超时设置
         transport = httpx.AsyncHTTPTransport(retries=2)  # 最多重试2次
@@ -389,7 +388,10 @@ class WeiboMonitor(Star):
                 targets = self.get_targets()
                 msg_format = self.message_format
 
-                if not urls:
+                cookie = self.config.get("weibo_cookie", "")
+                if not cookie:
+                    logger.warning("WeiboMonitor: 未配置微博Cookie，跳过本轮检查。请尽快配置！")
+                elif not urls:
                     logger.debug("WeiboMonitor: 未配置监控URL")
                 elif not targets:
                     logger.debug("WeiboMonitor: 未配置推送目标会话ID")
