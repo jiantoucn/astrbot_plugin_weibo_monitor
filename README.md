@@ -1,7 +1,10 @@
 # AstrBot 微博监控插件 (Weibo Monitor)
 
 定时监控微博用户动态并推送到指定会话。
+
 由 Trae 配合 Gemini-3-Flash-Preview 模型开发。
+
+可以 Star 一下吗，求求你了。🥺🥺🥺
 
 ## 功能特性
 
