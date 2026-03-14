@@ -515,12 +515,9 @@ class WeiboMonitor(Star):
             try:
                 # 根据媒体类型构建消息
                 if video_url:
-                    # 文字+视频：合并转发
-                    video_path = await self._download_to_tmp(video_url, ".mp4")
-                    media_components = []
-                    if video_path:
-                        tmp_files.append(video_path)
-                        media_components.append(Video.fromFileSystem(video_path))
+                    # AstrBot 文档建议视频优先使用 URL 发送，避免 fromFileSystem
+                    # 受限于机器人端文件系统可见性，且规避延迟读取临时文件导致的 ENOENT。
+                    media_components = [Video.fromURL(video_url)]
                     nodes_list = [Node(uin="0", name=post.get("username", "微博"), content=[Plain(content)])]
                     if media_components:
                         nodes_list.append(Node(uin="0", name=post.get("username", "微博"), content=media_components))
