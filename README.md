@@ -170,3 +170,6 @@ A: 建议：
 2. 启用间隔随机化（设置check_interval_jitter和request_interval_jitter）
 3. 定期更新Cookie，避免失效
 4. 监控账号数量不宜过多
+
+**Q: 在哪里可以找到日志文件？**  
+A: 请检查AstrBot/data/plugin_data/astrbot_plugin_weibo_monitor目录下的plugin.log文件。

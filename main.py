@@ -25,7 +25,7 @@ WEIBO_MOBILE_BASE = "https://m.weibo.cn"
 WEIBO_WEB_BASE = "https://weibo.com"
 
 
-@register("astrbot_plugin_weibo_monitor", "Sayaka", "定时监控微博用户动态并推送到指定会话。", "v1.10.1", "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor")
+@register("astrbot_plugin_weibo_monitor", "Sayaka", "定时监控微博用户动态并推送到指定会话。", "v1.10.2", "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor")
 class WeiboMonitor(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -83,6 +83,8 @@ class WeiboMonitor(Star):
                 self.plugin_logger.error(f"WeiboMonitor: 迁移数据失败: {e}")
 
         self._data = self._load_data()
+        
+        self.last_summary_date = self._data.get("last_summary_date", "")
 
         # 启动后台监控任务
         self.monitor_task = asyncio.create_task(self.run_monitor())
@@ -491,6 +493,8 @@ class WeiboMonitor(Star):
                         except Exception as e:
                             self.plugin_logger.error(f"发送每日总结失败: {e}")
                         self.last_summary_date = current_date_str
+                        self._data["last_summary_date"] = current_date_str
+                        self._save_data()
 
                 # 2. 检查是否需要执行监控
                 base_interval = max(1, self.config.get("check_interval", DEFAULT_CHECK_INTERVAL))
