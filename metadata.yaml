@@ -2,6 +2,6 @@ name: astrbot_plugin_weibo_monitor
 display_name: 微博监控助手
 desc: 定时监控微博用户动态并推送到指定会话。
 author: Sayaka
-version: v1.10.2
+version: v1.10.3
 help_url: https://github.com/jiantoucn/astrbot_plugin_weibo_monitor/blob/main/README.md
 repo: https://github.com/jiantoucn/astrbot_plugin_weibo_monitor

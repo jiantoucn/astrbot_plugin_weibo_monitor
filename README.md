@@ -130,6 +130,8 @@
 - `/weibo_verify`: 验证当前设置的 Cookie 是否有效。
 - `/weibo_check`: 立即抓取列表里第一个账号并推送最新一条微博。
 - `/weibo_check_all`: 立即抓取列表里所有账号并推送最新一条微博。
+- `/weibo_status`: 查看当前监控状态（监控账号数、推送目标、检查间隔等）。
+- `/weibo_summary`: 手动触发昨日总结推送。
 - `/weibo_export`: 将当前插件的所有配置导出为 Base64 字符串。
 - `/weibo_import [配置字符串]`: 使用导出的配置字符串快速恢复或迁移配置。
 ## 重要说明

@@ -25,7 +25,7 @@ WEIBO_MOBILE_BASE = "https://m.weibo.cn"
 WEIBO_WEB_BASE = "https://weibo.com"
 
 
-@register("astrbot_plugin_weibo_monitor", "Sayaka", "定时监控微博用户动态并推送到指定会话。", "v1.10.2", "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor")
+@register("astrbot_plugin_weibo_monitor", "Sayaka", "定时监控微博用户动态并推送到指定会话。", "v1.10.3", "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor")
 class WeiboMonitor(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -122,9 +122,9 @@ class WeiboMonitor(Star):
         """获取 UTC+8 时间"""
         return datetime.now(timezone(timedelta(hours=8)))
 
-    def _log_to_daily_file(self, post: dict):
+    def _log_to_daily_file(self, post: dict, skip_log: bool = False):
         """记录每日推送记录 (JSON 格式)"""
-        if not self.config.get("enable_daily_log", False):
+        if skip_log or not self.config.get("enable_daily_log", False):
             return
             
         now = self._get_utc8_now()
@@ -407,7 +407,7 @@ class WeiboMonitor(Star):
 
         latest_posts = await self.check_weibo(uid, force_fetch=True)
         if latest_posts:
-            await self._send_new_posts(latest_posts, targets, msg_format, event.unified_msg_origin)
+            await self._send_new_posts(latest_posts, targets, msg_format, event.unified_msg_origin, skip_log=True)
             yield event.plain_result(f"✅ {latest_posts[0].get('username')} 已发送最新动态。")
         else:
             yield event.plain_result(f"ℹ️ UID {uid} 未获取到有效微博。")
@@ -443,12 +443,110 @@ class WeiboMonitor(Star):
 
             latest_posts = await self.check_weibo(uid, force_fetch=True)
             if latest_posts:
-                await self._send_new_posts(latest_posts, targets, msg_format, event.unified_msg_origin)
+                await self._send_new_posts(latest_posts, targets, msg_format, event.unified_msg_origin, skip_log=True)
                 results.append(f"✅ {latest_posts[0].get('username')} 已发送最新动态。")
             else:
                 results.append(f"ℹ️ UID {uid} 未获取到有效微博。")
 
         yield event.plain_result("\n".join(results))
+
+    @filter.command("weibo_status")
+    async def weibo_status(self, event: AstrMessageEvent):
+        """查看当前监控状态"""
+        urls = self._parse_urls(self.config.get("weibo_urls", []))
+        targets = self.get_targets()
+        
+        status_lines = ["📊 微博监控当前状态："]
+        status_lines.append(f"- 监控账号数：{len(urls)} 个")
+        status_lines.append(f"- 推送目标数：{len(targets)} 个")
+        
+        check_interval = self.config.get("check_interval", DEFAULT_CHECK_INTERVAL)
+        status_lines.append(f"- 检查间隔：{check_interval} 分钟")
+        
+        cookie = self.config.get("weibo_cookie", "")
+        cookie_status = "✅ 已配置" if cookie else "❌ 未配置"
+        status_lines.append(f"- Cookie：{cookie_status}")
+        
+        status_lines.append(f"- 自动推送：{'✅ 开启' if targets and cookie else '❌ 关闭'}")
+        
+        daily_summary = self.config.get("enable_daily_summary", False)
+        if daily_summary:
+            summary_time = self.config.get("daily_summary_time", "08:00")
+            status_lines.append(f"- 每日总结：✅ 开启 ({summary_time})")
+        else:
+            status_lines.append(f"- 每日总结：❌ 关闭")
+        
+        if urls:
+            status_lines.append(f"\n📋 监控列表：")
+            for i, url in enumerate(urls[:5], 1):
+                status_lines.append(f"  {i}. {url}")
+            if len(urls) > 5:
+                status_lines.append(f"  ... 等共 {len(urls)} 个")
+        
+        yield event.plain_result("\n".join(status_lines))
+
+    @filter.command("weibo_summary")
+    async def weibo_summary(self, event: AstrMessageEvent):
+        """手动触发昨日总结推送"""
+        if not self.config.get("enable_daily_summary", False):
+            yield event.plain_result("❌ 每日总结功能未开启，请先在插件设置中启用。")
+            return
+        
+        targets = self.get_targets()
+        if not targets:
+            yield event.plain_result("❌ 未配置推送目标，无法发送每日总结。")
+            return
+        
+        yield event.plain_result("📊 正在生成昨日总结...")
+        
+        now = self._get_utc8_now()
+        yesterday = now - timedelta(days=1)
+        date_str = yesterday.strftime("%Y%m%d")
+        log_file = self.logs_dir / f"{date_str}.log"
+        
+        if not log_file.exists():
+            yield event.plain_result(f"ℹ️ 未找到昨日 ({yesterday.strftime('%Y-%m-%d')}) 的推送记录。")
+            return
+        
+        stats = {}
+        try:
+            with open(log_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        entry = json.loads(line)
+                        username = entry.get("username", "未知用户")
+                        stats[username] = stats.get(username, 0) + 1
+                    except:
+                        continue
+        except Exception as e:
+            self.plugin_logger.error(f"读取昨日日志文件失败: {e}")
+            yield event.plain_result(f"❌ 读取日志失败: {e}")
+            return
+        
+        if not stats:
+            summary_msg = f"📊 微博监控昨日 ({yesterday.strftime('%Y-%m-%d')}) 总结：\n\n昨日未推送任何动态。"
+        else:
+            summary_lines = [f"📊 微博监控昨日 ({yesterday.strftime('%Y-%m-%d')}) 总结："]
+            total = 0
+            for user, count in stats.items():
+                summary_lines.append(f"- {user}: {count} 条")
+                total += count
+            summary_lines.append(f"\n共计推送 {total} 条动态。")
+            summary_msg = "\n".join(summary_lines)
+        
+        chain = MessageChain().message(summary_msg)
+        success_count = 0
+        for target in targets:
+            try:
+                await self.context.send_message(target, chain)
+                success_count += 1
+            except Exception as e:
+                self.plugin_logger.error(f"发送每日总结到 {target} 失败: {e}")
+        
+        if success_count > 0:
+            yield event.plain_result(f"✅ 已向 {success_count}/{len(targets)} 个目标发送昨日总结。")
+        else:
+            yield event.plain_result("❌ 发送失败，所有目标均未发送成功。")
 
     @property
     def message_format(self) -> str:
@@ -583,14 +681,14 @@ class WeiboMonitor(Star):
                 self.plugin_logger.error(f"WeiboMonitor: 检查URL {url} 时出错: {e}")
 
     async def _send_new_posts(self, new_posts: List[dict], targets: List[str], msg_format: str, 
-                               fallback_target: str = None):
+                               fallback_target: str = None, skip_log: bool = False):
         """发送新微博到指定目标"""
         if not targets and fallback_target:
             targets = [fallback_target]
         
         for post in new_posts:
             # 记录到每日日志
-            self._log_to_daily_file(post)
+            self._log_to_daily_file(post, skip_log)
             
             content = msg_format.format(
                 name=post.get("username", "未知用户"),
