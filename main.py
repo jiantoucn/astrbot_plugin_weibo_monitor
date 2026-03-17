@@ -5,64 +5,193 @@ import os
 import json
 import base64
 import random
+import logging
+from logging.handlers import RotatingFileHandler
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Tuple, Dict, Any
+from functools import wraps
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.star import Context, Star, register, StarTools
-from astrbot.api import logger
 from bs4 import BeautifulSoup
 
 # 常量定义
 DEFAULT_CHECK_INTERVAL = 10  # 默认检查间隔（分钟）
 DEFAULT_REQUEST_INTERVAL = 5  # 默认请求间隔（秒）
 DEFAULT_TIMEOUT = 20  # 默认HTTP请求超时（秒）
+MAX_CONCURRENT_REQUESTS = 5  # 最大并发请求数
 DEFAULT_MESSAGE_TEMPLATE = "🔔 {name} 发微博啦！\n\n{weibo}\n\n链接: {link}"
 WEIBO_API_BASE = "https://m.weibo.cn/api/container/getIndex"
 WEIBO_MOBILE_BASE = "https://m.weibo.cn"
 WEIBO_WEB_BASE = "https://weibo.com"
 
 
-@register("astrbot_plugin_weibo_monitor", "Sayaka", "定时监控微博用户动态并推送到指定会话。", "v1.9.0", "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor")
+@register("astrbot_plugin_weibo_monitor", "Sayaka", "定时监控微博用户动态并推送到指定会话。", "v1.10.1", "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor")
 class WeiboMonitor(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
         self.config = config or {}
         self.monitor_task: Optional[asyncio.Task] = None
         
-        # 检查Cookie是否配置
-        cookie = self.config.get("weibo_cookie", "")
-        if not cookie:
-            logger.warning("WeiboMonitor: 未配置微博Cookie，插件无法正常工作！请在插件设置中填写weibo_cookie。")
-        
-        # 配置HTTP客户端，添加重试和超时设置
-        transport = httpx.AsyncHTTPTransport(retries=2)  # 最多重试2次
-        self.client = httpx.AsyncClient(
-            timeout=DEFAULT_TIMEOUT,
-            transport=transport,
-            follow_redirects=True
-        )
-        self.running = True
-        self.session_initialized_uids: set[str] = set()  # 跟踪本会话已初始化的UID
-
         # 确保数据目录存在
         self.data_dir = StarTools.get_data_dir()
         if not self.data_dir.exists():
             self.data_dir.mkdir(parents=True, exist_ok=True)
         self.data_file = self.data_dir / "monitor_data.json"
+        self.logs_dir = self.data_dir / "logs"
+        if not self.logs_dir.exists():
+            self.logs_dir.mkdir(parents=True, exist_ok=True)
+            
+        # 初始化日志
+        self.plugin_logger = logging.getLogger("astrbot_plugin_weibo_monitor")
+        self.plugin_logger.setLevel(logging.DEBUG)
+        self.plugin_logger.propagate = False # 不向上冒泡到 root logger
+        self.setup_logging()
         
+        # 检查Cookie是否配置
+        cookie = self.config.get("weibo_cookie", "")
+        if not cookie:
+            self.plugin_logger.warning("WeiboMonitor: 未配置微博Cookie，插件无法正常工作！请在插件设置中填写weibo_cookie。")
+        
+        # 配置HTTP客户端，添加重试、超时和连接池设置
+        self.limits = httpx.Limits(
+            max_keepalive_connections=10,
+            max_connections=MAX_CONCURRENT_REQUESTS,
+            keepalive_expiry=30.0
+        )
+        transport = httpx.AsyncHTTPTransport(retries=2)
+        self.client = httpx.AsyncClient(
+            timeout=DEFAULT_TIMEOUT,
+            transport=transport,
+            follow_redirects=True,
+            limits=self.limits
+        )
+        self.running = True
+        self.session_initialized_uids: set[str] = set()
+        self.last_summary_date: str = ""
+        self._request_semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+        self._consecutive_errors = 0
+        self._max_error_backoff = 300  # 最大退避时间5分钟
+
         # 兼容旧路径迁移 (data/astrbot_plugin_weibo_monitor -> StarTools.get_data_dir())
         old_data_file = os.path.join("data", "astrbot_plugin_weibo_monitor", "monitor_data.json")
         if not self.data_file.exists() and os.path.exists(old_data_file):
             try:
                 import shutil
                 shutil.copy2(old_data_file, self.data_file)
-                logger.info(f"WeiboMonitor: 已从旧路径迁移数据到 {self.data_file}")
+                self.plugin_logger.info(f"WeiboMonitor: 已从旧路径迁移数据到 {self.data_file}")
             except Exception as e:
-                logger.error(f"WeiboMonitor: 迁移数据失败: {e}")
+                self.plugin_logger.error(f"WeiboMonitor: 迁移数据失败: {e}")
 
         self._data = self._load_data()
 
         # 启动后台监控任务
         self.monitor_task = asyncio.create_task(self.run_monitor())
+
+    def setup_logging(self):
+        """设置运行日志"""
+        existing_handlers = self.plugin_logger.handlers
+        if any(isinstance(h, logging.FileHandler) for h in existing_handlers):
+            return
+            
+        for handler in existing_handlers:
+            if not isinstance(handler, logging.FileHandler):
+                self.plugin_logger.removeHandler(handler)
+            
+        if self.config.get("enable_plugin_log", False):
+            log_file = self.data_dir / "plugin.log"
+            max_size_mb = self.config.get("plugin_log_max_size", 1)
+            file_handler = RotatingFileHandler(
+                log_file, 
+                maxBytes=max_size_mb * 1024 * 1024, 
+                backupCount=3, 
+                encoding="utf-8"
+            )
+            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+            file_handler.setFormatter(formatter)
+            self.plugin_logger.addHandler(file_handler)
+            self.plugin_logger.info("运行日志功能已启用")
+        
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(logging.Formatter('%(levelname)s: %(message)s'))
+        if not any(isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler) for h in self.plugin_logger.handlers):
+            self.plugin_logger.addHandler(console_handler)
+
+    def _get_utc8_now(self) -> datetime:
+        """获取 UTC+8 时间"""
+        return datetime.now(timezone(timedelta(hours=8)))
+
+    def _log_to_daily_file(self, post: dict):
+        """记录每日推送记录 (JSON 格式)"""
+        if not self.config.get("enable_daily_log", False):
+            return
+            
+        now = self._get_utc8_now()
+        date_str = now.strftime("%Y%m%d")
+        log_file = self.logs_dir / f"{date_str}.log"
+        
+        log_entry = {
+            "time": now.strftime("%Y-%m-%d %H:%M:%S"),
+            "username": post.get("username", "未知用户"),
+            "content": post.get("text", ""),
+            "link": post.get("link", "")
+        }
+        
+        try:
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
+        except Exception as e:
+            self.plugin_logger.error(f"记录每日日志失败: {e}")
+
+    async def _send_daily_summary(self):
+        """发送每日总结"""
+        if not self.config.get("enable_daily_summary", False):
+            return
+
+        now = self._get_utc8_now()
+        yesterday = now - timedelta(days=1)
+        date_str = yesterday.strftime("%Y%m%d")
+        log_file = self.logs_dir / f"{date_str}.log"
+
+        if not log_file.exists():
+            self.plugin_logger.info(f"未找到昨日 ({date_str}) 的日志文件，跳过每日总结。")
+            return
+
+        stats = {}
+        try:
+            with open(log_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        entry = json.loads(line)
+                        username = entry.get("username", "未知用户")
+                        stats[username] = stats.get(username, 0) + 1
+                    except:
+                        continue
+        except Exception as e:
+            self.plugin_logger.error(f"读取昨日日志文件失败: {e}")
+            return
+
+        if not stats:
+            summary_msg = f"📊 微博监控昨日 ({yesterday.strftime('%Y-%m-%d')}) 总结：\n\n昨日未推送任何动态。"
+        else:
+            summary_lines = [f"📊 微博监控昨日 ({yesterday.strftime('%Y-%m-%d')}) 总结："]
+            total = 0
+            for user, count in stats.items():
+                summary_lines.append(f"- {user}: {count} 条")
+                total += count
+            summary_lines.append(f"\n共计推送 {total} 条动态。")
+            summary_msg = "\n".join(summary_lines)
+
+        targets = self.get_targets()
+        if not targets:
+            self.plugin_logger.warning("未配置推送目标，无法发送每日总结。")
+            return
+
+        chain = MessageChain().message(summary_msg)
+        for target in targets:
+            try:
+                await self.context.send_message(target, chain)
+            except Exception as e:
+                self.plugin_logger.error(f"发送每日总结到 {target} 失败: {e}")
 
     def _load_data(self) -> dict:
         """从文件加载持久化数据，损坏时自动备份"""
@@ -70,14 +199,14 @@ class WeiboMonitor(Star):
             try:
                 return json.loads(self.data_file.read_text(encoding="utf-8"))
             except Exception as e:
-                logger.error(f"WeiboMonitor: 加载数据文件失败: {e}")
+                self.plugin_logger.error(f"WeiboMonitor: 加载数据文件失败: {e}")
                 # 自动备份损坏的文件
                 try:
                     backup_file = self.data_file.with_suffix(f".bak.{int(asyncio.get_event_loop().time())}")
                     self.data_file.rename(backup_file)
-                    logger.info(f"WeiboMonitor: 已将损坏的数据文件备份为 {backup_file}")
+                    self.plugin_logger.info(f"WeiboMonitor: 已将损坏的数据文件备份为 {backup_file}")
                 except Exception as backup_err:
-                    logger.error(f"WeiboMonitor: 备份损坏的数据文件失败: {backup_err}")
+                    self.plugin_logger.error(f"WeiboMonitor: 备份损坏的数据文件失败: {backup_err}")
         return {}
 
     def _save_data(self):
@@ -92,7 +221,7 @@ class WeiboMonitor(Star):
             # 原子替换
             temp_file.replace(self.data_file)
         except Exception as e:
-            logger.error(f"WeiboMonitor: 保存数据文件失败: {e}")
+            self.plugin_logger.error(f"WeiboMonitor: 保存数据文件失败: {e}")
             # 清理临时文件
             try:
                 if temp_file.exists():
@@ -135,7 +264,7 @@ class WeiboMonitor(Star):
             except asyncio.CancelledError:
                 pass
         await self.client.aclose()
-        logger.info("WeiboMonitor 插件已停止")
+        self.plugin_logger.info("WeiboMonitor 插件已停止")
 
     def get_targets(self) -> List[str]:
         targets_raw = self.config.get("target_conversation_id", [])
@@ -171,7 +300,7 @@ class WeiboMonitor(Star):
                 f"💡 请妥善保管此字符串，在其他会话或环境中使用 /weibo_import [配置字符串] 即可导入。"
             )
         except Exception as e:
-            logger.error(f"WeiboMonitor: 导出配置失败: {e}")
+            self.plugin_logger.error(f"WeiboMonitor: 导出配置失败: {e}")
             yield event.plain_result(f"❌ 导出配置失败: {e}")
 
     @filter.command("weibo_import")
@@ -199,6 +328,9 @@ class WeiboMonitor(Star):
                 self.config[key] = value
                 count += 1
 
+            # 尝试重新设置日志（如果配置有变）
+            self.setup_logging()
+
             # 尝试调用框架的配置保存接口（如果支持）
             try:
                 if hasattr(self.context, "config_manager") and hasattr(self.context.config_manager, "save_config"):
@@ -211,7 +343,7 @@ class WeiboMonitor(Star):
                 f"注意：部分配置（如检查间隔）可能需要重启插件后才能完全生效。导入后请先刷新插件后台页面，否则配置无法显示。"
             )
         except Exception as e:
-            logger.error(f"WeiboMonitor: 导入配置失败: {e}")
+            self.plugin_logger.error(f"WeiboMonitor: 导入配置失败: {e}")
             yield event.plain_result(f"❌ 导入配置失败: {e}")
 
     @filter.command("weibo_verify")
@@ -248,7 +380,7 @@ class WeiboMonitor(Star):
             else:
                 yield event.plain_result(f"❌ 验证请求失败，状态码: {resp.status_code}")
         except Exception as e:
-            logger.error(f"WeiboMonitor: 验证过程中出现错误: {e}")
+            self.plugin_logger.error(f"WeiboMonitor: 验证过程中出现错误: {e}")
             yield event.plain_result(f"❌ 验证过程中出现错误: {e}")
 
     @filter.command("weibo_check")
@@ -325,42 +457,90 @@ class WeiboMonitor(Star):
 
     async def run_monitor(self):
         """后台监控主循环"""
-        logger.info("微博监控任务已启动")
+        self.plugin_logger.info("微博监控任务已启动")
         await asyncio.sleep(10)
+        
+        last_check_time = 0
+        error_backoff = 60
 
         while self.running:
             try:
-                urls = self._parse_urls(self.config.get("weibo_urls", []))
+                now = self._get_utc8_now()
+                current_time_str = now.strftime("%H:%M")
+                current_date_str = now.strftime("%Y%m%d")
                 
-                # 检查间隔随机化
+                # 重置错误计数和退避时间（正常运行时）
+                if self._consecutive_errors > 0:
+                    self._consecutive_errors = 0
+                    error_backoff = 60
+                    self.plugin_logger.info("WeiboMonitor: 连续错误已清除，恢复正常监控频率")
+                
+                # 1. 检查是否需要发送每日总结
+                summary_time = self.config.get("daily_summary_time", "08:00")
+                if self.config.get("enable_daily_summary", False):
+                    should_send_summary = False
+                    if self.last_summary_date != current_date_str and current_time_str >= summary_time:
+                        should_send_summary = True
+                    elif self.last_summary_date and self.last_summary_date < current_date_str and now.hour >= 8 and (int(now.strftime("%H%M")) - 800) < 10:
+                        should_send_summary = True
+                    
+                    if should_send_summary:
+                        self.plugin_logger.info(f"触发每日总结推送 (设定时间: {summary_time})")
+                        try:
+                            await self._send_daily_summary()
+                        except Exception as e:
+                            self.plugin_logger.error(f"发送每日总结失败: {e}")
+                        self.last_summary_date = current_date_str
+
+                # 2. 检查是否需要执行监控
                 base_interval = max(1, self.config.get("check_interval", DEFAULT_CHECK_INTERVAL))
                 interval_jitter = self.config.get("check_interval_jitter", 0)
                 actual_interval = max(1, random.randint(base_interval - interval_jitter, base_interval + interval_jitter))
                 
-                # 请求间隔参数
-                base_req_interval = self.config.get("request_interval", DEFAULT_REQUEST_INTERVAL)
-                req_jitter = self.config.get("request_interval_jitter", 0)
-                
-                targets = self.get_targets()
-                msg_format = self.message_format
+                if asyncio.get_event_loop().time() - last_check_time >= actual_interval * 60:
+                    urls = self._parse_urls(self.config.get("weibo_urls", []))
+                    targets = self.get_targets()
+                    msg_format = self.message_format
+                    cookie = self.config.get("weibo_cookie", "")
+                    
+                    if not cookie:
+                        self.plugin_logger.warning("WeiboMonitor: 未配置微博Cookie，跳过本轮检查。请尽快配置！")
+                    elif not urls:
+                        self.plugin_logger.debug("WeiboMonitor: 未配置监控URL")
+                    elif not targets:
+                        self.plugin_logger.debug("WeiboMonitor: 未配置推送目标会话ID")
+                    else:
+                        self.plugin_logger.info(f"开始新一轮监控检查，共 {len(urls)} 个账号")
+                        base_req_interval = self.config.get("request_interval", DEFAULT_REQUEST_INTERVAL)
+                        req_jitter = self.config.get("request_interval_jitter", 0)
+                        
+                        cycle_success = True
+                        try:
+                            await self._process_monitor_cycle(urls, base_req_interval, req_jitter, targets, msg_format)
+                        except Exception as cycle_error:
+                            self.plugin_logger.error(f"监控周期执行失败: {cycle_error}")
+                            cycle_success = False
+                        
+                        if cycle_success:
+                            self.plugin_logger.info(f"本轮监控检查完成，下次检查将在约 {actual_interval} 分钟后")
+                        else:
+                            self._consecutive_errors += 1
+                            error_backoff = min(self._max_error_backoff, 60 * (2 ** min(self._consecutive_errors, 5)))
+                            self.plugin_logger.warning(f"连续错误次数: {self._consecutive_errors}，退避等待: {error_backoff}秒")
+                    
+                    last_check_time = asyncio.get_event_loop().time()
 
-                cookie = self.config.get("weibo_cookie", "")
-                if not cookie:
-                    logger.warning("WeiboMonitor: 未配置微博Cookie，跳过本轮检查。请尽快配置！")
-                elif not urls:
-                    logger.debug("WeiboMonitor: 未配置监控URL")
-                elif not targets:
-                    logger.debug("WeiboMonitor: 未配置推送目标会话ID")
-                else:
-                    await self._process_monitor_cycle(urls, base_req_interval, req_jitter, targets, msg_format)
-
-                logger.debug(f"WeiboMonitor: 下次检查将在 {actual_interval} 分钟后执行")
-                await asyncio.sleep(actual_interval * 60)
+                await asyncio.sleep(60)
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"WeiboMonitor 运行时错误: {e}")
-                await asyncio.sleep(60)
+                self._consecutive_errors += 1
+                error_backoff = min(self._max_error_backoff, 60 * (2 ** min(self._consecutive_errors, 5)))
+                self.plugin_logger.error(f"WeiboMonitor 运行时错误 (连续错误 {self._consecutive_errors} 次): {e}")
+                import traceback
+                self.plugin_logger.error(traceback.format_exc())
+                self.plugin_logger.info(f"退避 {error_backoff} 秒后重试...")
+                await asyncio.sleep(error_backoff)
 
     def _parse_urls(self, urls_raw: Any) -> List[str]:
         """解析监控URL列表，支持字符串逗号分隔或列表格式"""
@@ -389,14 +569,14 @@ class WeiboMonitor(Star):
 
                 uid = await self.parse_uid(url)
                 if not uid:
-                    logger.warning(f"WeiboMonitor: 无法解析URL {url}，已跳过")
+                    self.plugin_logger.warning(f"WeiboMonitor: 无法解析URL {url}，已跳过")
                     continue
 
                 new_posts = await self.check_weibo(uid)
                 if new_posts:
                     await self._send_new_posts(new_posts, targets, msg_format)
             except Exception as e:
-                logger.error(f"WeiboMonitor: 检查URL {url} 时出错: {e}")
+                self.plugin_logger.error(f"WeiboMonitor: 检查URL {url} 时出错: {e}")
 
     async def _send_new_posts(self, new_posts: List[dict], targets: List[str], msg_format: str, 
                                fallback_target: str = None):
@@ -405,6 +585,9 @@ class WeiboMonitor(Star):
             targets = [fallback_target]
         
         for post in new_posts:
+            # 记录到每日日志
+            self._log_to_daily_file(post)
+            
             content = msg_format.format(
                 name=post.get("username", "未知用户"),
                 weibo=post["text"],
@@ -415,7 +598,7 @@ class WeiboMonitor(Star):
             send_targets = targets
             
             if not send_targets:
-                logger.debug(f"WeiboMonitor: 没有配置推送目标，跳过推送 {post.get('username')} 的微博")
+                self.plugin_logger.debug(f"WeiboMonitor: 没有配置推送目标，跳过推送 {post.get('username')} 的微博")
                 continue
                 
             sent_count = 0
@@ -424,10 +607,10 @@ class WeiboMonitor(Star):
                     await self.context.send_message(target, chain)
                     sent_count += 1
                 except Exception as e:
-                    logger.error(f"WeiboMonitor: 推送到目标 {target} 时出错: {e}")
+                    self.plugin_logger.error(f"WeiboMonitor: 推送到目标 {target} 时出错: {e}")
             
             if sent_count > 0:
-                logger.info(
+                self.plugin_logger.info(
                     f"WeiboMonitor: 已向 {sent_count}/{len(send_targets)} 个目标推送 {post.get('username')} 的更新"
                 )
 
@@ -444,51 +627,60 @@ class WeiboMonitor(Star):
         if url.isdigit():
             return url
 
-        # 匹配 /u/UID 格式
         match = re.search(r"weibo\.(com|cn)/u/(\d+)", url)
         if match:
             return match.group(2)
 
-        # 匹配 /n/用户名 格式
         match_name = re.search(r"weibo\.(com|cn)/n/([^/?#]+)", url)
         if match_name:
             name = match_name.group(2)
-            try:
-                # 请求跳转接口
-                resp = await self.client.get(
-                    f"{WEIBO_MOBILE_BASE}/n/{name}",
-                    headers=self.get_headers(),
-                )
-                # 从最终跳转的URL中提取UID
-                final_url = str(resp.url)
-                match_uid = re.search(r"/u/(\d+)", final_url)
-                if match_uid:
-                    return match_uid.group(1)
-                logger.debug(f"WeiboMonitor: 用户名 {name} 跳转后无法解析UID，最终URL: {final_url}")
-            except Exception as e:
-                logger.error(f"WeiboMonitor: 解析用户名 {name} 失败: {e}")
+            async with self._request_semaphore:
+                try:
+                    resp = await self.client.get(
+                        f"{WEIBO_MOBILE_BASE}/n/{name}",
+                        headers=self.get_headers(),
+                    )
+                    if resp.status_code == 429:
+                        self.plugin_logger.warning(f"WeiboMonitor: 解析用户名时触发限流 (429)，等待后重试")
+                        await asyncio.sleep(60)
+                        resp = await self.client.get(
+                            f"{WEIBO_MOBILE_BASE}/n/{name}",
+                            headers=self.get_headers(),
+                        )
+                    final_url = str(resp.url)
+                    match_uid = re.search(r"/u/(\d+)", final_url)
+                    if match_uid:
+                        return match_uid.group(1)
+                    self.plugin_logger.debug(f"WeiboMonitor: 用户名 {name} 跳转后无法解析UID，最终URL: {final_url}")
+                except Exception as e:
+                    self.plugin_logger.error(f"WeiboMonitor: 解析用户名 {name} 失败: {e}")
         return None
 
     async def _fetch_weibo_cards(self, uid: str) -> List[dict]:
         """获取指定UID的微博卡片列表"""
         api_url = f"{WEIBO_API_BASE}?type=uid&value={uid}&containerid=107603{uid}"
-        try:
-            resp = await self.client.get(api_url, headers=self.get_headers(uid))
-            if resp.status_code != 200:
-                logger.error(f"WeiboMonitor: 接口请求失败 (状态码 {resp.status_code}), UID: {uid}")
-                return []
+        async with self._request_semaphore:
             try:
-                data = resp.json()
-            except ValueError as e:
-                logger.error(f"WeiboMonitor: 解析接口返回的JSON数据失败, UID: {uid}, 错误: {e}")
+                resp = await self.client.get(api_url, headers=self.get_headers(uid))
+                if resp.status_code == 429:
+                    self.plugin_logger.warning(f"WeiboMonitor: 触发限流 (429)，UID: {uid}，等待 60 秒后重试")
+                    await asyncio.sleep(60)
+                    resp = await self.client.get(api_url, headers=self.get_headers(uid))
+                if resp.status_code != 200:
+                    self.plugin_logger.error(f"WeiboMonitor: 接口请求失败 (状态码 {resp.status_code}), UID: {uid}")
+                    return []
+                try:
+                    data = resp.json()
+                except ValueError as e:
+                    self.plugin_logger.error(f"WeiboMonitor: 解析接口返回的JSON数据失败, UID: {uid}, 错误: {e}")
+                    return []
+                if data.get("ok") != 1:
+                    self.plugin_logger.debug(f"WeiboMonitor: 接口返回数据状态异常, UID: {uid}")
+                    return []
+                return (data.get("data") or {}).get("cards", [])
+            except Exception as e:
+                self.plugin_logger.error(f"WeiboMonitor: 获取UID {uid} 数据时出错: {e}")
                 return []
-            if data.get("ok") != 1:
-                logger.debug(f"WeiboMonitor: 接口返回数据状态异常, UID: {uid}")
-                return []
-            return (data.get("data") or {}).get("cards", [])
-        except Exception as e:
-            logger.error(f"WeiboMonitor: 获取UID {uid} 数据时出错: {e}")
-            return []
 
     def _extract_valid_mblogs(self, cards: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], str]:
         """从卡片列表中提取有效的微博博文，并过滤置顶"""
@@ -525,13 +717,18 @@ class WeiboMonitor(Star):
         :return: 包含新微博信息的列表
         """
         try:
+            self.plugin_logger.debug(f"正在检查 UID: {uid}")
             cards = await self._fetch_weibo_cards(uid)
             if not cards:
+                self.plugin_logger.debug(f"UID {uid} 未获取到卡片数据")
                 return []
 
             valid_mblogs, username = self._extract_valid_mblogs(cards)
             if not valid_mblogs:
+                self.plugin_logger.debug(f"UID {uid} ({username}) 未发现有效的微博博文")
                 return []
+
+            self.plugin_logger.debug(f"UID {uid} ({username}) 获取到 {len(valid_mblogs)} 条有效博文")
 
             last_id_key = f"last_id_{uid}"
             last_id_str = await self.get_kv_data(last_id_key, "0")
@@ -552,11 +749,14 @@ class WeiboMonitor(Star):
                 await self._update_last_id(valid_mblogs, last_id, last_id_key)
 
             if new_posts:
+                self.plugin_logger.info(f"UID {uid} ({username}) 发现 {len(new_posts)} 条新微博")
                 new_posts.reverse()  # 按时间从旧到新排列
+            else:
+                self.plugin_logger.debug(f"UID {uid} ({username}) 没有新微博 (last_id: {last_id})")
 
             return new_posts
         except Exception as e:
-            logger.error(f"WeiboMonitor: 检查UID {uid} 时出错: {e}")
+            self.plugin_logger.error(f"WeiboMonitor: 检查UID {uid} 时出错: {e}")
             return []
 
     async def _initialize_monitor(self, uid: str, username: str, 
@@ -570,9 +770,9 @@ class WeiboMonitor(Star):
             self.session_initialized_uids.add(uid)
             
             if old_last_id == 0:
-                logger.info(f"WeiboMonitor: 已初始化全新监控 UID {uid} ({username})，起始 ID: {latest_id}")
+                self.plugin_logger.info(f"WeiboMonitor: 已初始化全新监控 UID {uid} ({username})，起始 ID: {latest_id}")
             else:
-                logger.info(f"WeiboMonitor: 已同步会话初始状态，UID {uid} ({username})，当前最新 ID: {latest_id}")
+                self.plugin_logger.info(f"WeiboMonitor: 已同步会话初始状态，UID {uid} ({username})，当前最新 ID: {latest_id}")
         return []
 
     def _collect_new_posts(self, uid: str, valid_mblogs: List[Dict[str, Any]], 
@@ -598,10 +798,10 @@ class WeiboMonitor(Star):
             # 区分原创和转发
             is_forward = "retweeted_status" in mblog
             if is_forward and not send_forward:
-                logger.info(f"WeiboMonitor: 微博 {current_id} 是转发微博，已根据配置跳过推送")
+                self.plugin_logger.info(f"WeiboMonitor: 微博 {current_id} 是转发微博，已根据配置跳过推送")
                 continue
             if not is_forward and not send_original:
-                logger.info(f"WeiboMonitor: 微博 {current_id} 是原创微博，已根据配置跳过推送")
+                self.plugin_logger.info(f"WeiboMonitor: 微博 {current_id} 是原创微博，已根据配置跳过推送")
                 continue
 
             text = self.clean_text(mblog.get("text", ""))
@@ -617,7 +817,7 @@ class WeiboMonitor(Star):
 
             bid = mblog.get("bid")
             if not bid:
-                logger.debug(f"WeiboMonitor: 微博 {current_id} 缺少bid字段，已跳过")
+                self.plugin_logger.debug(f"WeiboMonitor: 微博 {current_id} 缺少bid字段，已跳过")
                 continue
             link = f"{WEIBO_WEB_BASE}/{uid}/{bid}"
             new_posts.append({"text": text, "link": link, "username": username})
@@ -631,7 +831,7 @@ class WeiboMonitor(Star):
         """检查文本是否包含屏蔽词"""
         for keyword in filter_keywords:
             if keyword and keyword in text:
-                logger.info(f"WeiboMonitor: 微博 {post_id} 包含屏蔽词 '{keyword}'，已跳过推送")
+                self.plugin_logger.info(f"WeiboMonitor: 微博 {post_id} 包含屏蔽词 '{keyword}'，已跳过推送")
                 return True
         return False
 
@@ -641,9 +841,9 @@ class WeiboMonitor(Star):
             return False
         for keyword in whitelist_keywords:
             if keyword and keyword in text:
-                logger.info(f"WeiboMonitor: 微博 {post_id} 包含白名单关键词 '{keyword}'，允许推送")
+                self.plugin_logger.info(f"WeiboMonitor: 微博 {post_id} 包含白名单关键词 '{keyword}'，允许推送")
                 return False
-        logger.info(f"WeiboMonitor: 微博 {post_id} 不包含任何白名单关键词，已跳过推送")
+        self.plugin_logger.info(f"WeiboMonitor: 微博 {post_id} 不包含任何白名单关键词，已跳过推送")
         return True
 
     async def _update_last_id(self, valid_mblogs: List[Dict[str, Any]], 
@@ -693,5 +893,5 @@ class WeiboMonitor(Star):
             
             return text.strip()
         except Exception as e:
-            logger.error(f"WeiboMonitor: 清理文本内容失败: {e}")
+            self.plugin_logger.error(f"WeiboMonitor: 清理文本内容失败: {e}")
             return text

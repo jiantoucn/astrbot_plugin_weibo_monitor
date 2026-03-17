@@ -6,6 +6,12 @@
     "description": "微博用户主页链接",
     "hint": "可以填写多个，例如: https://weibo.com/u/1234567890"
   },
+  "weibo_cookie": {
+    "type": "string",
+    "default": "",
+    "description": "微博 Cookie",
+    "hint": "必须配置微博 Cookie 才能正常抓取数据，确保稳定性"
+  },
   "check_interval": {
     "type": "int",
     "default": 10,
@@ -36,12 +42,6 @@
     "description": "推送目标会话 ID",
     "hint": "可以填写多个。通过指令 /get_umo 获取当前会话 ID"
   },
-  "weibo_cookie": {
-    "type": "string",
-    "default": "",
-    "description": "微博 Cookie",
-    "hint": "必须配置微博 Cookie 才能正常抓取数据，确保稳定性"
-  },
   "message_format": {
     "type": "string",
     "default": "🔔 {name} 发微博啦！\n\n{weibo}\n\n链接: {link}",
@@ -71,5 +71,34 @@
     "type": "bool",
     "default": true,
     "description": "是否推送转发微博"
+  },
+  "enable_plugin_log": {
+    "type": "bool",
+    "default": false,
+    "description": "开启运行日志 (plugin.log)",
+    "hint": "记录插件运行详细情况，方便排查问题"
+  },
+  "plugin_log_max_size": {
+    "type": "int",
+    "default": 1,
+    "description": "运行日志文件最大大小 (MB)"
+  },
+  "enable_daily_log": {
+    "type": "bool",
+    "default": false,
+    "description": "开启每日推送记录",
+    "hint": "记录每天推送的微博内容，以便进行统计或分析"
+  },
+  "enable_daily_summary": {
+    "type": "bool",
+    "default": false,
+    "description": "开启每日发送总结",
+    "hint": "每天定时推送前一天的监控统计信息"
+  },
+  "daily_summary_time": {
+    "type": "string",
+    "default": "08:00",
+    "description": "每日总结推送时间",
+    "hint": "24小时制，例如: 08:00"
   }
 }
