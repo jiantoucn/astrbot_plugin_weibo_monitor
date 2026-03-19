@@ -25,7 +25,7 @@ WEIBO_MOBILE_BASE = "https://m.weibo.cn"
 WEIBO_WEB_BASE = "https://weibo.com"
 
 
-@register("astrbot_plugin_weibo_monitor", "Sayaka", "定时监控微博用户动态并推送到指定会话。", "v1.10.3", "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor")
+@register("astrbot_plugin_weibo_monitor", "Sayaka", "定时监控微博用户动态并推送到指定会话。", "v1.11.0", "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor")
 class WeiboMonitor(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -122,23 +122,96 @@ class WeiboMonitor(Star):
         """获取 UTC+8 时间"""
         return datetime.now(timezone(timedelta(hours=8)))
 
+    def _parse_weibo_time(self, time_str: str) -> str:
+        """
+        解析微博时间字符串为标准格式 YYYY-MM-DD HH:mm:ss
+        """
+        if not time_str:
+            return self._get_utc8_now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        now = self._get_utc8_now()
+        
+        try:
+            if "刚刚" in time_str:
+                return now.strftime("%Y-%m-%d %H:%M:%S")
+            
+            if "分钟前" in time_str:
+                minutes = int(re.search(r"(\d+)", time_str).group(1))
+                res = now - timedelta(minutes=minutes)
+                return res.strftime("%Y-%m-%d %H:%M:%S")
+            
+            if "小时前" in time_str:
+                hours = int(re.search(r"(\d+)", time_str).group(1))
+                res = now - timedelta(hours=hours)
+                return res.strftime("%Y-%m-%d %H:%M:%S")
+            
+            if "昨天" in time_str:
+                time_part = re.search(r"(\d{2}:\d{2})", time_str).group(1)
+                yesterday = now - timedelta(days=1)
+                return f"{yesterday.strftime('%Y-%m-%d')} {time_part}:00"
+            
+            if "-" in time_str:
+                parts = time_str.split("-")
+                if len(parts) == 2: # MM-DD
+                    return f"{now.year}-{time_str} 00:00:00"
+                elif len(parts) == 3: # YYYY-MM-DD
+                    return f"{time_str} 00:00:00"
+            
+            # 尝试解析微博标准时间格式: Sat Mar 08 16:51:30 +0800 2025
+            try:
+                dt = datetime.strptime(time_str, "%a %b %d %H:%M:%S %z %Y")
+                return dt.strftime("%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                pass
+
+            return time_str
+        except Exception as e:
+            self.plugin_logger.error(f"解析微博时间失败 ({time_str}): {e}")
+            return now.strftime("%Y-%m-%d %H:%M:%S")
+
     def _log_to_daily_file(self, post: dict, skip_log: bool = False):
         """记录每日推送记录 (JSON 格式)"""
         if skip_log or not self.config.get("enable_daily_log", False):
             return
             
         now = self._get_utc8_now()
-        date_str = now.strftime("%Y%m%d")
+        publish_time_str = post.get("created_at")
+        
+        # 确定日志文件名和时间戳
+        if publish_time_str:
+            try:
+                # 解析 YYYY-MM-DD HH:mm:ss
+                publish_time = datetime.strptime(publish_time_str, "%Y-%m-%d %H:%M:%S")
+                date_str = publish_time.strftime("%Y%m%d")
+                log_time_str = publish_time_str
+            except:
+                date_str = now.strftime("%Y%m%d")
+                log_time_str = now.strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            date_str = now.strftime("%Y%m%d")
+            log_time_str = now.strftime("%Y-%m-%d %H:%M:%S")
+
         log_file = self.logs_dir / f"{date_str}.log"
         
         log_entry = {
-            "time": now.strftime("%Y-%m-%d %H:%M:%S"),
+            "time": log_time_str,
             "username": post.get("username", "未知用户"),
             "content": post.get("text", ""),
             "link": post.get("link", "")
         }
         
         try:
+            # 检查是否已存在相同的记录（避免重复记录）
+            if log_file.exists():
+                with open(log_file, "r", encoding="utf-8") as f:
+                    for line in f:
+                        try:
+                            entry = json.loads(line)
+                            if entry.get("link") == post.get("link"):
+                                return
+                        except:
+                            continue
+            
             with open(log_file, "a", encoding="utf-8") as f:
                 f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
         except Exception as e:
@@ -873,6 +946,25 @@ class WeiboMonitor(Star):
             
             if old_last_id == 0:
                 self.plugin_logger.info(f"WeiboMonitor: 已初始化全新监控 UID {uid} ({username})，起始 ID: {latest_id}")
+                
+                # 如果开启了每日日志，将获取到的历史微博记录下来
+                if self.config.get("enable_daily_log", False):
+                    self.plugin_logger.info(f"WeiboMonitor: 正在将 UID {uid} 的历史微博记录到日志...")
+                    for mblog in reversed(valid_mblogs): # 从旧到新记录
+                        text = self.clean_text(mblog.get("text", ""))
+                        bid = mblog.get("bid")
+                        if not bid: continue
+                        link = f"{WEIBO_WEB_BASE}/{uid}/{bid}"
+                        created_at_raw = mblog.get("created_at")
+                        created_at = self._parse_weibo_time(created_at_raw)
+                        
+                        post = {
+                            "text": text,
+                            "link": link,
+                            "username": username,
+                            "created_at": created_at
+                        }
+                        self._log_to_daily_file(post)
             else:
                 self.plugin_logger.info(f"WeiboMonitor: 已同步会话初始状态，UID {uid} ({username})，当前最新 ID: {latest_id}")
         return []
@@ -922,7 +1014,16 @@ class WeiboMonitor(Star):
                 self.plugin_logger.debug(f"WeiboMonitor: 微博 {current_id} 缺少bid字段，已跳过")
                 continue
             link = f"{WEIBO_WEB_BASE}/{uid}/{bid}"
-            new_posts.append({"text": text, "link": link, "username": username})
+            
+            created_at_raw = mblog.get("created_at")
+            created_at = self._parse_weibo_time(created_at_raw)
+            
+            new_posts.append({
+                "text": text, 
+                "link": link, 
+                "username": username,
+                "created_at": created_at
+            })
 
             if force_fetch:  # 强制获取模式只取第一条
                 break
