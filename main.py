@@ -25,12 +25,13 @@ WEIBO_MOBILE_BASE = "https://m.weibo.cn"
 WEIBO_WEB_BASE = "https://weibo.com"
 
 
-@register("astrbot_plugin_weibo_monitor", "Sayaka", "定时监控微博用户动态并推送到指定会话。", "v1.11.0", "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor")
+@register("astrbot_plugin_weibo_monitor", "Sayaka", "定时监控微博用户动态并推送到指定会话。", "v1.11.1", "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor")
 class WeiboMonitor(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
         self.config = config or {}
         self.monitor_task: Optional[asyncio.Task] = None
+        self.cookie_invalid_notified = False # cookie 失效是否已通知
         
         # 确保数据目录存在
         self.data_dir = StarTools.get_data_dir()
@@ -628,6 +629,20 @@ class WeiboMonitor(Star):
             "message_format", DEFAULT_MESSAGE_TEMPLATE
         ).replace("\\n", "\n")
 
+    async def _check_cookie_health(self) -> bool:
+        """检查 Cookie 有效性"""
+        try:
+            resp = await self.client.get(
+                f"{WEIBO_MOBILE_BASE}/api/config", headers=self.get_headers()
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                return bool((data.get("data") or {}).get("login"))
+            return False
+        except Exception as e:
+            self.plugin_logger.debug(f"WeiboMonitor: 检查 Cookie 健康状态失败: {e}")
+            return False
+
     async def run_monitor(self):
         """后台监控主循环"""
         self.plugin_logger.info("微博监控任务已启动")
@@ -685,23 +700,41 @@ class WeiboMonitor(Star):
                     elif not targets:
                         self.plugin_logger.debug("WeiboMonitor: 未配置推送目标会话ID")
                     else:
-                        self.plugin_logger.info(f"开始新一轮监控检查，共 {len(urls)} 个账号")
-                        base_req_interval = self.config.get("request_interval", DEFAULT_REQUEST_INTERVAL)
-                        req_jitter = self.config.get("request_interval_jitter", 0)
-                        
-                        cycle_success = True
-                        try:
-                            await self._process_monitor_cycle(urls, base_req_interval, req_jitter, targets, msg_format)
-                        except Exception as cycle_error:
-                            self.plugin_logger.error(f"监控周期执行失败: {cycle_error}")
-                            cycle_success = False
-                        
-                        if cycle_success:
-                            self.plugin_logger.info(f"本轮监控检查完成，下次检查将在约 {actual_interval} 分钟后")
+                        # 检查 Cookie 健康
+                        is_cookie_healthy = await self._check_cookie_health()
+                        if not is_cookie_healthy:
+                            if not self.cookie_invalid_notified:
+                                self.plugin_logger.warning("WeiboMonitor: 检测到 Cookie 已失效！已向用户发送通知。")
+                                chain = MessageChain().message("⚠️ 微博监控助手提醒：检测到您的微博 Cookie 已失效，插件将无法正常抓取数据。请尽快在后台更新 Cookie 以恢复监控功能！")
+                                for target in targets:
+                                    try:
+                                        await self.context.send_message(target, chain)
+                                    except:
+                                        pass
+                                self.cookie_invalid_notified = True
+                            self.plugin_logger.debug("WeiboMonitor: Cookie 已失效，跳过本轮抓取。")
                         else:
-                            self._consecutive_errors += 1
-                            error_backoff = min(self._max_error_backoff, 60 * (2 ** min(self._consecutive_errors, 5)))
-                            self.plugin_logger.warning(f"连续错误次数: {self._consecutive_errors}，退避等待: {error_backoff}秒")
+                            if self.cookie_invalid_notified:
+                                self.plugin_logger.info("WeiboMonitor: 检测到 Cookie 已更新为有效状态。")
+                                self.cookie_invalid_notified = False # 恢复通知标志
+
+                            self.plugin_logger.info(f"开始新一轮监控检查，共 {len(urls)} 个账号")
+                            base_req_interval = self.config.get("request_interval", DEFAULT_REQUEST_INTERVAL)
+                            req_jitter = self.config.get("request_interval_jitter", 0)
+                            
+                            cycle_success = True
+                            try:
+                                await self._process_monitor_cycle(urls, base_req_interval, req_jitter, targets, msg_format)
+                            except Exception as cycle_error:
+                                self.plugin_logger.error(f"监控周期执行失败: {cycle_error}")
+                                cycle_success = False
+                            
+                            if cycle_success:
+                                self.plugin_logger.info(f"本轮监控检查完成，下次检查将在约 {actual_interval} 分钟后")
+                            else:
+                                self._consecutive_errors += 1
+                                error_backoff = min(self._max_error_backoff, 60 * (2 ** min(self._consecutive_errors, 5)))
+                                self.plugin_logger.warning(f"连续错误次数: {self._consecutive_errors}，退避等待: {error_backoff}秒")
                     
                     last_check_time = asyncio.get_event_loop().time()
 
