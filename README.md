@@ -49,6 +49,7 @@
    - `request_interval`: 账号请求间隔（秒），默认 5 秒。监控多个账号时，每个账号抓取之间会等待该时长，避免请求过快。
    - `request_interval_jitter`: 请求间隔随机浮动范围（秒），默认 0。
    - `target_conversation_id`: 填入第 2 步获取的会话 ID。支持填入多个 ID，用逗号分隔。
+   - `cookie_notification_target`: **可选**。填入 Cookie 失效时的通知目标会话 ID。如果不填写，则向 `target_conversation_id` 中所有的群/账号发送通知；如果填写，则仅向该 ID 发送通知。
    - `message_format`: 自定义推送消息格式，支持 `{name}`、`{weibo}`、`{link}` 变量。
    - `filter_keywords`: 屏蔽词列表，包含这些关键词的微博将不会被推送，多个关键词用逗号分隔。
    - `whitelist_keywords`: 关键词白名单，只有微博正文包含白名单关键词时才会推送。为空时不限制。

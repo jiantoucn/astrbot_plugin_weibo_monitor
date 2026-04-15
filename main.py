@@ -25,7 +25,7 @@ WEIBO_MOBILE_BASE = "https://m.weibo.cn"
 WEIBO_WEB_BASE = "https://weibo.com"
 
 
-@register("astrbot_plugin_weibo_monitor", "Sayaka", "定时监控微博用户动态并推送到指定会话。", "v1.11.1", "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor")
+@register("astrbot_plugin_weibo_monitor", "Sayaka", "定时监控微博用户动态并推送到指定会话。", "v1.11.2", "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor")
 class WeiboMonitor(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -706,7 +706,15 @@ class WeiboMonitor(Star):
                             if not self.cookie_invalid_notified:
                                 self.plugin_logger.warning("WeiboMonitor: 检测到 Cookie 已失效！已向用户发送通知。")
                                 chain = MessageChain().message("⚠️ 微博监控助手提醒：检测到您的微博 Cookie 已失效，插件将无法正常抓取数据。请尽快在后台更新 Cookie 以恢复监控功能！")
-                                for target in targets:
+                                
+                                # 获取通知目标：优先使用专门配置的通知目标，否则使用默认推送目标
+                                notification_target = self.config.get("cookie_notification_target", "")
+                                if notification_target:
+                                    notify_targets = [notification_target]
+                                else:
+                                    notify_targets = targets
+                                    
+                                for target in notify_targets:
                                     try:
                                         await self.context.send_message(target, chain)
                                     except:

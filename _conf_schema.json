@@ -42,6 +42,12 @@
     "description": "推送目标会话 ID",
     "hint": "可以填写多个。通过指令 /get_umo 获取当前会话 ID"
   },
+  "cookie_notification_target": {
+    "type": "string",
+    "default": "",
+    "description": "Cookie 失效通知目标",
+    "hint": "可选。如果不填写，则向 '推送目标会话 ID' 中所有的群/账号发送通知；如果填写，则仅向该 ID 发送通知。"
+  },
   "message_format": {
     "type": "string",
     "default": "🔔 {name} 发微博啦！\n\n{weibo}\n\n链接: {link}",
