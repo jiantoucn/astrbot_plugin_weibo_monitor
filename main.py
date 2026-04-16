@@ -25,7 +25,7 @@ WEIBO_MOBILE_BASE = "https://m.weibo.cn"
 WEIBO_WEB_BASE = "https://weibo.com"
 
 
-@register("astrbot_plugin_weibo_monitor", "Sayaka", "定时监控微博用户动态并推送到指定会话。", "v1.11.2", "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor")
+@register("astrbot_plugin_weibo_monitor", "Sayaka", "定时监控微博用户动态并推送到指定会话。", "v1.11.3", "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor")
 class WeiboMonitor(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -709,8 +709,18 @@ class WeiboMonitor(Star):
                                 
                                 # 获取通知目标：优先使用专门配置的通知目标，否则使用默认推送目标
                                 notification_target = self.config.get("cookie_notification_target", "")
-                                if notification_target:
-                                    notify_targets = [notification_target]
+                                if isinstance(notification_target, str) and notification_target.strip():
+                                    notify_targets = [t.strip() for t in notification_target.split(",") if t.strip()]
+                                elif isinstance(notification_target, list) and notification_target:
+                                    notify_targets = []
+                                    for item in notification_target:
+                                        item_str = str(item).strip()
+                                        if "," in item_str:
+                                            notify_targets.extend([t.strip() for t in item_str.split(",") if t.strip()])
+                                        elif item_str:
+                                            notify_targets.append(item_str)
+                                    if not notify_targets:
+                                        notify_targets = targets
                                 else:
                                     notify_targets = targets
                                     
