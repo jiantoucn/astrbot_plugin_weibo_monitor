@@ -23,9 +23,13 @@ DEFAULT_MESSAGE_TEMPLATE = "🔔 {name} 发微博啦！\n\n{weibo}\n\n链接: {l
 WEIBO_API_BASE = "https://m.weibo.cn/api/container/getIndex"
 WEIBO_MOBILE_BASE = "https://m.weibo.cn"
 WEIBO_WEB_BASE = "https://weibo.com"
+HOTSEARCH_API_URL = "https://m.weibo.cn/api/container/getIndex?containerid=106003type%3D25%26t%3D3%26disable_hot%3D1%26filter_type%3Drealtimehot"
+DEFAULT_HOTSEARCH_INTERVAL = 60
+DEFAULT_HOTSEARCH_TOP_N = 10
+DEFAULT_HOTSEARCH_TEMPLATE = "🔥 微博热搜榜 Top {top_n}\n⏰ 更新时间: {time}\n\n{items}"
 
 
-@register("astrbot_plugin_weibo_monitor", "Sayaka", "定时监控微博用户动态并推送到指定会话。", "v1.11.3", "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor")
+@register("astrbot_plugin_weibo_monitor", "Sayaka", "定时监控微博用户动态并推送到指定会话。", "v1.12.2", "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor")
 class WeiboMonitor(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -86,6 +90,7 @@ class WeiboMonitor(Star):
         self._data = self._load_data()
         
         self.last_summary_date = self._data.get("last_summary_date", "")
+        self.last_hotsearch_time = 0
 
         # 启动后台监控任务
         self.monitor_task = asyncio.create_task(self.run_monitor())
@@ -218,6 +223,28 @@ class WeiboMonitor(Star):
         except Exception as e:
             self.plugin_logger.error(f"记录每日日志失败: {e}")
 
+    def _log_hotsearch_to_daily(self, items: List[dict]):
+        """记录热搜推送到每日日志 (JSON 格式)"""
+        if not self.config.get("enable_daily_log", False):
+            return
+
+        now = self._get_utc8_now()
+        date_str = now.strftime("%Y%m%d")
+        log_file = self.logs_dir / f"{date_str}.log"
+
+        log_entry = {
+            "type": "hotsearch",
+            "time": now.strftime("%Y-%m-%d %H:%M:%S"),
+            "count": len(items),
+            "items": [item.get("desc", "") for item in items]
+        }
+
+        try:
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
+        except Exception as e:
+            self.plugin_logger.error(f"记录热搜每日日志失败: {e}")
+
     async def _send_daily_summary(self):
         """发送每日总结"""
         if not self.config.get("enable_daily_summary", False):
@@ -233,28 +260,40 @@ class WeiboMonitor(Star):
             return
 
         stats = {}
+        hotsearch_count = 0
+        has_any_entry = False
         try:
             with open(log_file, "r", encoding="utf-8") as f:
                 for line in f:
                     try:
                         entry = json.loads(line)
-                        username = entry.get("username", "未知用户")
-                        stats[username] = stats.get(username, 0) + 1
+                        has_any_entry = True
+                        if entry.get("type") == "hotsearch":
+                            hotsearch_count += 1
+                        else:
+                            username = entry.get("username", "未知用户")
+                            stats[username] = stats.get(username, 0) + 1
                     except:
                         continue
         except Exception as e:
             self.plugin_logger.error(f"读取昨日日志文件失败: {e}")
             return
 
-        if not stats:
+        if not has_any_entry:
             summary_msg = f"📊 微博监控昨日 ({yesterday.strftime('%Y-%m-%d')}) 总结：\n\n昨日未推送任何动态。"
         else:
-            summary_lines = [f"📊 微博监控昨日 ({yesterday.strftime('%Y-%m-%d')}) 总结："]
-            total = 0
-            for user, count in stats.items():
-                summary_lines.append(f"- {user}: {count} 条")
-                total += count
-            summary_lines.append(f"\n共计推送 {total} 条动态。")
+            summary_lines = [f"📊 微博监控昨日 ({yesterday.strftime('%Y-%m-%d')}) 总结：\n"]
+            if stats:
+                summary_lines.append("📢 微博动态：")
+                total = 0
+                for user, count in stats.items():
+                    summary_lines.append(f"  - {user}: {count} 条")
+                    total += count
+                summary_lines.append(f"  共计 {total} 条")
+            else:
+                summary_lines.append("📢 微博动态：无")
+            if hotsearch_count > 0:
+                summary_lines.append(f"\n🔥 热搜推送：{hotsearch_count} 次")
             summary_msg = "\n".join(summary_lines)
 
         targets = self.get_targets()
@@ -268,6 +307,130 @@ class WeiboMonitor(Star):
                 await self.context.send_message(target, chain)
             except Exception as e:
                 self.plugin_logger.error(f"发送每日总结到 {target} 失败: {e}")
+
+    async def _fetch_hotsearch(self) -> List[dict]:
+        """获取微博热搜榜数据，返回热搜条目列表"""
+        try:
+            self.plugin_logger.debug("正在获取微博热搜数据...")
+            async with self._request_semaphore:
+                resp = await self.client.get(
+                    HOTSEARCH_API_URL,
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/604.1",
+                        "Accept": "application/json, text/plain, */*",
+                        "Referer": f"{WEIBO_MOBILE_BASE}/",
+                    }
+                )
+                if resp.status_code == 429:
+                    self.plugin_logger.warning("获取热搜数据触发限流 (429)，等待 60 秒后重试")
+                    await asyncio.sleep(60)
+                    resp = await self.client.get(
+                        HOTSEARCH_API_URL,
+                        headers={
+                            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/604.1",
+                            "Accept": "application/json, text/plain, */*",
+                            "Referer": f"{WEIBO_MOBILE_BASE}/",
+                        }
+                    )
+                if resp.status_code != 200:
+                    self.plugin_logger.error(f"获取热搜数据失败，状态码: {resp.status_code}")
+                    return []
+
+                data = resp.json()
+                if data.get("ok") != 1:
+                    self.plugin_logger.debug("热搜接口返回数据状态异常")
+                    return []
+
+                cards = (data.get("data") or {}).get("cards", [])
+                if not cards:
+                    return []
+
+                card_group = cards[0].get("card_group", [])
+                if not card_group:
+                    return []
+
+                filter_ads = self.config.get("hotsearch_filter_ads", True)
+                items = []
+                for item in card_group:
+                    if not isinstance(item, dict):
+                        continue
+                    if filter_ads and item.get("is_ad_pos"):
+                        self.plugin_logger.debug(f"已过滤广告位热搜: {item.get('desc', '')}")
+                        continue
+                    if not item.get("desc"):
+                        continue
+
+                    itemid = str(item.get("itemid", ""))
+                    if "realpos" not in itemid:
+                        self.plugin_logger.debug(f"已过滤非排名条目: {item.get('desc', '')}")
+                        continue
+
+                    desc_extr = item.get("desc_extr", "")
+                    heat = ""
+                    if isinstance(desc_extr, (int, float)):
+                        heat = str(int(desc_extr))
+                    elif isinstance(desc_extr, str) and desc_extr.strip():
+                        parts = desc_extr.rsplit(" ", 1)
+                        if len(parts) == 2 and parts[1].replace(",", "").isdigit():
+                            heat = parts[1]
+                        else:
+                            heat = desc_extr
+
+                    items.append({
+                        "desc": str(item["desc"]),
+                        "heat": heat,
+                        "scheme": item.get("scheme", ""),
+                    })
+
+                self.plugin_logger.info(f"成功获取 {len(items)} 条热搜数据")
+                return items
+
+        except Exception as e:
+            self.plugin_logger.error(f"获取热搜数据出错: {e}")
+            return []
+
+    async def _push_hotsearch(self, items: List[dict], targets: List[str]):
+        """推送热搜榜到目标会话"""
+        if not items:
+            self.plugin_logger.debug("热搜条目为空，跳过推送")
+            return
+
+        top_n = self.config.get("hotsearch_top_n", DEFAULT_HOTSEARCH_TOP_N)
+        display_items = items[:top_n]
+
+        now = self._get_utc8_now()
+        time_str = now.strftime("%Y-%m-%d %H:%M")
+
+        item_lines = []
+        for idx, item in enumerate(display_items, 1):
+            rank_emoji = {1: "🥇", 2: "🥈", 3: "🥉"}.get(idx, f"{idx}.")
+            heat_str = f"  🔥{item['heat']}" if item["heat"] else ""
+            item_lines.append(f"{rank_emoji} {item['desc']}{heat_str}")
+
+        items_text = "\n".join(item_lines)
+
+        template = self.config.get(
+            "hotsearch_message_format", DEFAULT_HOTSEARCH_TEMPLATE
+        ).replace("\\n", "\n")
+
+        content = template.format(
+            top_n=str(len(display_items)),
+            time=time_str,
+            items=items_text,
+        )
+
+        chain = MessageChain().message(content)
+        sent_count = 0
+        for target in targets:
+            try:
+                await self.context.send_message(target, chain)
+                sent_count += 1
+            except Exception as e:
+                self.plugin_logger.error(f"推送热搜到 {target} 失败: {e}")
+
+        if sent_count > 0:
+            self.plugin_logger.info(f"已向 {sent_count}/{len(targets)} 个目标推送热搜榜")
+            self._log_hotsearch_to_daily(display_items)
 
     def _load_data(self) -> dict:
         """从文件加载持久化数据，损坏时自动备份"""
@@ -524,6 +687,29 @@ class WeiboMonitor(Star):
 
         yield event.plain_result("\n".join(results))
 
+    @filter.command("weibo_hot")
+    async def weibo_hot(self, event: AstrMessageEvent):
+        """手动查询当前微博热搜榜"""
+        if not self.config.get("enable_hotsearch", False):
+            yield event.plain_result("❌ 热搜监控功能未开启，请先在插件设置中启用。")
+            return
+
+        targets = self.get_targets()
+        if not targets:
+            targets = [event.unified_msg_origin]
+
+        yield event.plain_result("🔥 正在获取微博热搜榜...")
+        try:
+            hot_items = await self._fetch_hotsearch()
+            if hot_items:
+                await self._push_hotsearch(hot_items, targets)
+                yield event.plain_result("✅ 热搜榜已发送。")
+            else:
+                yield event.plain_result("❌ 未获取到热搜数据，请稍后重试。")
+        except Exception as e:
+            self.plugin_logger.error(f"手动查询热搜出错: {e}")
+            yield event.plain_result(f"❌ 查询热搜失败: {e}")
+
     @filter.command("weibo_status")
     async def weibo_status(self, event: AstrMessageEvent):
         """查看当前监控状态"""
@@ -549,7 +735,15 @@ class WeiboMonitor(Star):
             status_lines.append(f"- 每日总结：✅ 开启 ({summary_time})")
         else:
             status_lines.append(f"- 每日总结：❌ 关闭")
-        
+
+        hotsearch_enabled = self.config.get("enable_hotsearch", False)
+        if hotsearch_enabled:
+            hotsearch_interval = self.config.get("hotsearch_interval", DEFAULT_HOTSEARCH_INTERVAL)
+            hotsearch_top_n = self.config.get("hotsearch_top_n", DEFAULT_HOTSEARCH_TOP_N)
+            status_lines.append(f"- 热搜监控：✅ 开启 (每 {hotsearch_interval} 分钟, Top {hotsearch_top_n})")
+        else:
+            status_lines.append(f"- 热搜监控：❌ 关闭")
+
         if urls:
             status_lines.append(f"\n📋 监控列表：")
             for i, url in enumerate(urls[:5], 1):
@@ -583,13 +777,19 @@ class WeiboMonitor(Star):
             return
         
         stats = {}
+        hotsearch_count = 0
+        has_any_entry = False
         try:
             with open(log_file, "r", encoding="utf-8") as f:
                 for line in f:
                     try:
                         entry = json.loads(line)
-                        username = entry.get("username", "未知用户")
-                        stats[username] = stats.get(username, 0) + 1
+                        has_any_entry = True
+                        if entry.get("type") == "hotsearch":
+                            hotsearch_count += 1
+                        else:
+                            username = entry.get("username", "未知用户")
+                            stats[username] = stats.get(username, 0) + 1
                     except:
                         continue
         except Exception as e:
@@ -597,15 +797,21 @@ class WeiboMonitor(Star):
             yield event.plain_result(f"❌ 读取日志失败: {e}")
             return
         
-        if not stats:
+        if not has_any_entry:
             summary_msg = f"📊 微博监控昨日 ({yesterday.strftime('%Y-%m-%d')}) 总结：\n\n昨日未推送任何动态。"
         else:
-            summary_lines = [f"📊 微博监控昨日 ({yesterday.strftime('%Y-%m-%d')}) 总结："]
-            total = 0
-            for user, count in stats.items():
-                summary_lines.append(f"- {user}: {count} 条")
-                total += count
-            summary_lines.append(f"\n共计推送 {total} 条动态。")
+            summary_lines = [f"📊 微博监控昨日 ({yesterday.strftime('%Y-%m-%d')}) 总结：\n"]
+            if stats:
+                summary_lines.append("📢 微博动态：")
+                total = 0
+                for user, count in stats.items():
+                    summary_lines.append(f"  - {user}: {count} 条")
+                    total += count
+                summary_lines.append(f"  共计 {total} 条")
+            else:
+                summary_lines.append("📢 微博动态：无")
+            if hotsearch_count > 0:
+                summary_lines.append(f"\n🔥 热搜推送：{hotsearch_count} 次")
             summary_msg = "\n".join(summary_lines)
         
         chain = MessageChain().message(summary_msg)
@@ -681,6 +887,25 @@ class WeiboMonitor(Star):
                         self.last_summary_date = current_date_str
                         self._data["last_summary_date"] = current_date_str
                         self._save_data()
+
+                # 1.5 检查是否需要推送热搜
+                if self.config.get("enable_hotsearch", False):
+                    hotsearch_interval = max(5, self.config.get("hotsearch_interval", DEFAULT_HOTSEARCH_INTERVAL))
+                    if asyncio.get_event_loop().time() - self.last_hotsearch_time >= hotsearch_interval * 60:
+                        targets = self.get_targets()
+                        if not targets:
+                            self.plugin_logger.debug("WeiboMonitor: 未配置推送目标，跳过热搜推送")
+                        else:
+                            self.plugin_logger.info("开始获取微博热搜数据...")
+                            try:
+                                hot_items = await self._fetch_hotsearch()
+                                if hot_items:
+                                    await self._push_hotsearch(hot_items, targets)
+                                else:
+                                    self.plugin_logger.warning("未获取到热搜数据，本次跳过")
+                            except Exception as e:
+                                self.plugin_logger.error(f"热搜推送出错: {e}")
+                        self.last_hotsearch_time = asyncio.get_event_loop().time()
 
                 # 2. 检查是否需要执行监控
                 base_interval = max(1, self.config.get("check_interval", DEFAULT_CHECK_INTERVAL))
