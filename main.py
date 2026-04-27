@@ -23,13 +23,13 @@ DEFAULT_MESSAGE_TEMPLATE = "🔔 {name} 发微博啦！\n\n{weibo}\n\n链接: {l
 WEIBO_API_BASE = "https://m.weibo.cn/api/container/getIndex"
 WEIBO_MOBILE_BASE = "https://m.weibo.cn"
 WEIBO_WEB_BASE = "https://weibo.com"
-HOTSEARCH_API_URL = "https://m.weibo.cn/api/container/getIndex?containerid=106003type%3D25%26t%3D3%26disable_hot%3D1%26filter_type%3Drealtimehot"
+HOTSEARCH_API_URL = "https://weibo.com/ajax/side/hotSearch"
 DEFAULT_HOTSEARCH_INTERVAL = 60
 DEFAULT_HOTSEARCH_TOP_N = 10
 DEFAULT_HOTSEARCH_TEMPLATE = "🔥 微博热搜榜 Top {top_n}\n⏰ 更新时间: {time}\n\n{items}"
 
 
-@register("astrbot_plugin_weibo_monitor", "Sayaka", "定时监控微博用户动态并推送到指定会话。", "v1.12.2", "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor")
+@register("astrbot_plugin_weibo_monitor", "Sayaka", "定时监控微博用户动态并推送到指定会话。", "v1.12.4", "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor")
 class WeiboMonitor(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -313,73 +313,82 @@ class WeiboMonitor(Star):
         try:
             self.plugin_logger.debug("正在获取微博热搜数据...")
             async with self._request_semaphore:
-                resp = await self.client.get(
-                    HOTSEARCH_API_URL,
-                    headers={
-                        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/604.1",
-                        "Accept": "application/json, text/plain, */*",
-                        "Referer": f"{WEIBO_MOBILE_BASE}/",
-                    }
-                )
+                headers = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    "Accept": "application/json, text/plain, */*",
+                    "Referer": "https://weibo.com/",
+                }
+                
+                # 尝试不带 Cookie 获取
+                resp = await self.client.get(HOTSEARCH_API_URL, headers=headers)
+                
                 if resp.status_code == 429:
                     self.plugin_logger.warning("获取热搜数据触发限流 (429)，等待 60 秒后重试")
                     await asyncio.sleep(60)
-                    resp = await self.client.get(
-                        HOTSEARCH_API_URL,
-                        headers={
-                            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/604.1",
-                            "Accept": "application/json, text/plain, */*",
-                            "Referer": f"{WEIBO_MOBILE_BASE}/",
-                        }
-                    )
+                    resp = await self.client.get(HOTSEARCH_API_URL, headers=headers)
+                
+                need_cookie_fallback = False
+                data = {}
                 if resp.status_code != 200:
-                    self.plugin_logger.error(f"获取热搜数据失败，状态码: {resp.status_code}")
-                    return []
+                    self.plugin_logger.warning(f"无Cookie获取热搜失败，状态码: {resp.status_code}")
+                    need_cookie_fallback = True
+                else:
+                    try:
+                        data = resp.json()
+                        if data.get("ok") != 1:
+                            self.plugin_logger.warning("无Cookie热搜接口返回数据异常")
+                            need_cookie_fallback = True
+                    except Exception as e:
+                        self.plugin_logger.warning(f"无Cookie热搜接口解析JSON失败: {e}")
+                        need_cookie_fallback = True
+                
+                # 如果无 Cookie 获取失败，且配置了 Cookie，则尝试带 Cookie 获取
+                if need_cookie_fallback:
+                    cookie = self.config.get("weibo_cookie", "")
+                    if not cookie:
+                        self.plugin_logger.error("无Cookie获取失败，且未配置 weibo_cookie，无法兜底")
+                        return []
+                    
+                    self.plugin_logger.info("尝试携带 Cookie 获取热搜数据兜底...")
+                    headers["Cookie"] = cookie
+                    resp = await self.client.get(HOTSEARCH_API_URL, headers=headers)
+                    
+                    if resp.status_code != 200:
+                        self.plugin_logger.error(f"带Cookie获取热搜数据失败，状态码: {resp.status_code}")
+                        return []
+                    
+                    try:
+                        data = resp.json()
+                        if data.get("ok") != 1:
+                            self.plugin_logger.error("带Cookie热搜接口返回数据状态异常")
+                            return []
+                    except Exception as e:
+                        self.plugin_logger.error(f"带Cookie热搜接口解析JSON失败: {e}")
+                        return []
 
-                data = resp.json()
-                if data.get("ok") != 1:
-                    self.plugin_logger.debug("热搜接口返回数据状态异常")
-                    return []
-
-                cards = (data.get("data") or {}).get("cards", [])
-                if not cards:
-                    return []
-
-                card_group = cards[0].get("card_group", [])
-                if not card_group:
+                realtime = data.get("data", {}).get("realtime", [])
+                if not realtime:
                     return []
 
                 filter_ads = self.config.get("hotsearch_filter_ads", True)
                 items = []
-                for item in card_group:
+                for item in realtime:
                     if not isinstance(item, dict):
                         continue
-                    if filter_ads and item.get("is_ad_pos"):
-                        self.plugin_logger.debug(f"已过滤广告位热搜: {item.get('desc', '')}")
+                    if filter_ads and (item.get("is_ad") == 1 or item.get("is_ad_pos") == 1):
+                        self.plugin_logger.debug(f"已过滤广告位热搜: {item.get('word', '')}")
                         continue
-                    if not item.get("desc"):
-                        continue
-
-                    itemid = str(item.get("itemid", ""))
-                    if "realpos" not in itemid:
-                        self.plugin_logger.debug(f"已过滤非排名条目: {item.get('desc', '')}")
+                    
+                    word = item.get("word") or item.get("note")
+                    if not word:
                         continue
 
-                    desc_extr = item.get("desc_extr", "")
-                    heat = ""
-                    if isinstance(desc_extr, (int, float)):
-                        heat = str(int(desc_extr))
-                    elif isinstance(desc_extr, str) and desc_extr.strip():
-                        parts = desc_extr.rsplit(" ", 1)
-                        if len(parts) == 2 and parts[1].replace(",", "").isdigit():
-                            heat = parts[1]
-                        else:
-                            heat = desc_extr
-
+                    heat = str(item.get("num", ""))
+                    
                     items.append({
-                        "desc": str(item["desc"]),
+                        "desc": str(word),
                         "heat": heat,
-                        "scheme": item.get("scheme", ""),
+                        "scheme": f"https://s.weibo.com/weibo?q=%23{word}%23"
                     })
 
                 self.plugin_logger.info(f"成功获取 {len(items)} 条热搜数据")
