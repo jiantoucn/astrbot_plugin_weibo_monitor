@@ -29,7 +29,7 @@ DEFAULT_HOTSEARCH_TOP_N = 10
 DEFAULT_HOTSEARCH_TEMPLATE = "🔥 微博热搜榜 Top {top_n}\n⏰ 更新时间: {time}\n\n{items}"
 
 
-@register("astrbot_plugin_weibo_monitor", "Sayaka", "定时监控微博用户动态并推送到指定会话。", "v1.12.4", "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor")
+@register("astrbot_plugin_weibo_monitor", "Sayaka", "定时监控微博用户动态并推送到指定会话。", "v1.12.5", "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor")
 class WeiboMonitor(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -412,11 +412,9 @@ class WeiboMonitor(Star):
 
         item_lines = []
         for idx, item in enumerate(display_items, 1):
-            rank_emoji = {1: "🥇", 2: "🥈", 3: "🥉"}.get(idx, f"{idx}.")
-            heat_str = f"  🔥{item['heat']}" if item["heat"] else ""
-            item_lines.append(f"{rank_emoji} {item['desc']}{heat_str}")
+            item_lines.append(f"{idx}. {item['desc']}\n   {item['scheme']}")
 
-        items_text = "\n".join(item_lines)
+        items_text = "\n\n".join(item_lines)
 
         template = self.config.get(
             "hotsearch_message_format", DEFAULT_HOTSEARCH_TEMPLATE
