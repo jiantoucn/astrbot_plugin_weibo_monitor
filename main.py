@@ -10,6 +10,7 @@ from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Tuple, Dict, Any
 from functools import wraps
+from urllib.parse import quote
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.star import Context, Star, register, StarTools
 from bs4 import BeautifulSoup
@@ -29,7 +30,7 @@ DEFAULT_HOTSEARCH_TOP_N = 10
 DEFAULT_HOTSEARCH_TEMPLATE = "🔥 微博热搜榜 Top {top_n}\n⏰ 更新时间: {time}\n\n{items}"
 
 
-@register("astrbot_plugin_weibo_monitor", "Sayaka", "定时监控微博用户动态并推送到指定会话。", "v1.12.5", "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor")
+@register("astrbot_plugin_weibo_monitor", "Sayaka", "定时监控微博用户动态并推送到指定会话。", "v1.12.6", "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor")
 class WeiboMonitor(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -388,7 +389,7 @@ class WeiboMonitor(Star):
                     items.append({
                         "desc": str(word),
                         "heat": heat,
-                        "scheme": f"https://s.weibo.com/weibo?q=%23{word}%23"
+                        "scheme": f"https://s.weibo.com/weibo?q={quote(word)}"
                     })
 
                 self.plugin_logger.info(f"成功获取 {len(items)} 条热搜数据")
