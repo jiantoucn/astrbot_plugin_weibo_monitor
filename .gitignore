@@ -156,6 +156,5 @@ cython_debug/
 
 # Project specific
 data/
-RECOMMEND.md
 /.claude
-CLAUDE.md
+RECOMMEND.md
