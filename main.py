@@ -30,7 +30,7 @@ DEFAULT_HOTSEARCH_TOP_N = 10
 DEFAULT_HOTSEARCH_TEMPLATE = "🔥 微博热搜榜 Top {top_n}\n⏰ 更新时间: {time}\n\n{items}"
 
 
-@register("astrbot_plugin_weibo_monitor", "Sayaka", "定时监控微博用户动态并推送到指定会话。", "v1.13.0", "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor")
+@register("astrbot_plugin_weibo_monitor", "Sayaka", "定时监控微博用户动态并推送到指定会话。", "v1.13.1", "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor")
 class WeiboMonitor(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -92,6 +92,7 @@ class WeiboMonitor(Star):
         
         self.last_summary_date = self._data.get("last_summary_date", "")
         self.last_hotsearch_time = 0
+        self._init_last_hotsearch_time()
 
         # 启动后台监控任务
         self.monitor_task = asyncio.create_task(self.run_monitor())
@@ -245,6 +246,55 @@ class WeiboMonitor(Star):
                 f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
         except Exception as e:
             self.plugin_logger.error(f"记录热搜每日日志失败: {e}")
+
+    def _init_last_hotsearch_time(self):
+        """检查日志和持久化数据，若 30 分钟内已推送过热搜，初始化 last_hotsearch_time 以避免重载后刷屏"""
+        try:
+            now = self._get_utc8_now()
+            cutoff = now - timedelta(minutes=30)
+            last_push_time = None
+
+            for date_offset in [0, 1]:
+                check_date = now - timedelta(days=date_offset)
+                log_file = self.logs_dir / f"{check_date.strftime('%Y%m%d')}.log"
+                if not log_file.exists():
+                    continue
+                try:
+                    with open(log_file, "r", encoding="utf-8") as f:
+                        for line in f:
+                            try:
+                                entry = json.loads(line)
+                                if entry.get("type") == "hotsearch":
+                                    entry_time = datetime.strptime(
+                                        entry["time"], "%Y-%m-%d %H:%M:%S"
+                                    ).replace(tzinfo=now.tzinfo)
+                                    if entry_time > cutoff and (last_push_time is None or entry_time > last_push_time):
+                                        last_push_time = entry_time
+                            except (json.JSONDecodeError, KeyError, ValueError):
+                                continue
+                except Exception as e:
+                    self.plugin_logger.debug(f"读取日志文件 {log_file} 失败: {e}")
+
+            stored_time_str = self._data.get("last_hotsearch_push_time")
+            if stored_time_str:
+                try:
+                    stored_time = datetime.strptime(
+                        stored_time_str, "%Y-%m-%d %H:%M:%S"
+                    ).replace(tzinfo=now.tzinfo)
+                    if stored_time > cutoff and (last_push_time is None or stored_time > last_push_time):
+                        last_push_time = stored_time
+                except ValueError:
+                    pass
+
+            if last_push_time:
+                elapsed = (now - last_push_time).total_seconds()
+                loop_time = asyncio.get_event_loop().time()
+                self.last_hotsearch_time = loop_time - elapsed
+                self.plugin_logger.info(
+                    f"检测到最近一次热搜推送在 {elapsed / 60:.1f} 分钟前，已跳过初始推送"
+                )
+        except Exception as e:
+            self.plugin_logger.error(f"初始化热搜推送时间失败: {e}")
 
     async def _send_daily_summary(self):
         """发送每日总结"""
@@ -439,6 +489,8 @@ class WeiboMonitor(Star):
         if sent_count > 0:
             self.plugin_logger.info(f"已向 {sent_count}/{len(targets)} 个目标推送热搜榜")
             self._log_hotsearch_to_daily(display_items)
+            self._data["last_hotsearch_push_time"] = now.strftime("%Y-%m-%d %H:%M:%S")
+            self._save_data()
 
     def _load_data(self) -> dict:
         """从文件加载持久化数据，损坏时自动备份"""
