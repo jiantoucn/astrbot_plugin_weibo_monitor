@@ -30,7 +30,7 @@ DEFAULT_HOTSEARCH_TOP_N = 10
 DEFAULT_HOTSEARCH_TEMPLATE = "🔥 微博热搜榜 Top {top_n}\n⏰ 更新时间: {time}\n\n{items}"
 
 
-@register("astrbot_plugin_weibo_monitor", "Sayaka", "定时监控微博用户动态并推送到指定会话。", "v1.12.6", "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor")
+@register("astrbot_plugin_weibo_monitor", "Sayaka", "定时监控微博用户动态并推送到指定会话。", "v1.13.0", "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor")
 class WeiboMonitor(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -629,6 +629,63 @@ class WeiboMonitor(Star):
         except Exception as e:
             self.plugin_logger.error(f"WeiboMonitor: 验证过程中出现错误: {e}")
             yield event.plain_result(f"❌ 验证过程中出现错误: {e}")
+
+    @filter.command("weibo_cookie")
+    async def weibo_cookie(self, event: AstrMessageEvent, cookie: str = ""):
+        """更换微博 Cookie 并自动重载插件"""
+        if not cookie:
+            yield event.plain_result("❌ 请提供 Cookie。用法: /weibo_cookie <Cookie字符串>")
+            return
+
+        self.config["weibo_cookie"] = cookie
+        self.cookie_invalid_notified = False
+
+        try:
+            if hasattr(self.context, "config_manager") and hasattr(self.context.config_manager, "save_config"):
+                self.context.config_manager.save_config()
+                saved = True
+            else:
+                saved = False
+        except Exception as e:
+            self.plugin_logger.error(f"WeiboMonitor: 保存配置失败: {e}")
+            saved = False
+
+        yield event.plain_result("🔄 Cookie 已更新，正在验证有效性...")
+        try:
+            resp = await self.client.get(
+                "https://m.weibo.cn/api/config", headers=self.get_headers()
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                data_obj = data.get("data") or {}
+                if data_obj.get("login"):
+                    user = data_obj.get("user")
+                    user_info = f"当前登录用户: {user.get('screen_name')} (UID: {user.get('id')})" if user else f"已登录 (UID: {data_obj.get('uid')})"
+                    save_msg = "✅ 配置已持久化保存" if saved else "⚠️ 配置已更新但未能持久化保存，重启后可能丢失"
+                    self.plugin_logger.info(f"WeiboMonitor: Cookie 已通过命令更换，{save_msg}")
+                    yield event.plain_result(
+                        f"✅ Cookie 更换成功！{user_info}\n{save_msg}\n"
+                        f"🔄 正在重载插件..."
+                    )
+                    try:
+                        if hasattr(self.context, "star_loader") and hasattr(self.context.star_loader, "reload"):
+                            self.context.star_loader.reload("astrbot_plugin_weibo_monitor")
+                        elif hasattr(self.context, "reload_plugin"):
+                            self.context.reload_plugin("astrbot_plugin_weibo_monitor")
+                        else:
+                            yield event.plain_result("⚠️ 无法自动重载插件，请手动在 WebUI 插件管理中点击「重载插件」，或重启 AstrBot。\n💡 新 Cookie 已生效，无需重载亦可正常使用。")
+                    except Exception as reload_err:
+                        self.plugin_logger.warning(f"WeiboMonitor: 自动重载插件失败: {reload_err}")
+                        yield event.plain_result("⚠️ 自动重载失败，请手动在 WebUI 插件管理中点击「重载插件」。\n💡 新 Cookie 已生效，无需重载亦可正常使用。")
+                else:
+                    yield event.plain_result(
+                        "❌ Cookie 已更新但验证失败（接口返回 login: false），请检查 Cookie 是否正确。"
+                    )
+            else:
+                yield event.plain_result(f"❌ Cookie 已更新但验证请求失败，状态码: {resp.status_code}")
+        except Exception as e:
+            self.plugin_logger.error(f"WeiboMonitor: 更换 Cookie 后验证出错: {e}")
+            yield event.plain_result(f"❌ Cookie 已更新但验证过程出错: {e}")
 
     @filter.command("weibo_check")
     async def weibo_check(self, event: AstrMessageEvent):
