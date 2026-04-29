@@ -13,6 +13,25 @@
 - `_load_data()`: 加载数据，损坏时自动备份
 - `_save_data()`: 原子写入（先写 `.tmp` 再替换），防止数据损坏
 
+## 相似度去重缓存文件
+
+路径: `StarTools.get_data_dir() / "similarity_cache.json"`
+
+存储内容: 按 UID 分组的已推送微博 SimHash 指纹和原文摘要，用于相似度去重。
+
+```json
+{
+  "1234567890": [
+    {"hash": 12345, "text": "微博正文..."},
+    ...
+  ]
+}
+```
+
+读写方法:
+- `_load_similarity_cache()`: 启动时加载缓存
+- `_save_similarity_cache()`: 原子写入，每次更新缓存后自动保存
+
 ## 每日日志文件
 
 目录: `StarTools.get_data_dir() / "logs"`

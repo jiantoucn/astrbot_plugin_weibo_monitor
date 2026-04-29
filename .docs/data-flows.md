@@ -11,7 +11,7 @@ _extract_valid_mblogs(cards)      # 提取有效博文，过滤置顶（isTop, i
   ↓
 check_weibo(uid)                  # 比较 last_id，筛选新微博
   ↓
-_collect_new_posts(posts)         # 应用屏蔽词/白名单/原创转发过滤
+_collect_new_posts(posts)         # 应用屏蔽词/白名单/原创转发过滤/相似度去重
   ↓
 _send_new_posts(posts, targets)   # 推送到目标会话
 ```

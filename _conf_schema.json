@@ -78,6 +78,24 @@
     "default": true,
     "description": "是否推送转发微博"
   },
+  "enable_similarity_dedup": {
+    "type": "bool",
+    "default": false,
+    "description": "启用相似度去重（实验功能）",
+    "hint": "🧪 实验功能，未来可能根据反馈调整。开启后自动过滤与近期推送内容相似的微博，避免重复推送。基于 SimHash + Jaccard 混合算法，对文本进行快速指纹比对与精准相似度验证。"
+  },
+  "similarity_threshold": {
+    "type": "number",
+    "default": 0.7,
+    "description": "相似度阈值",
+    "hint": "Jaccard 相似度超过此值视为重复内容，范围 0.0~1.0。建议 0.6~0.8，值越小去重越激进。"
+  },
+  "similarity_cache_size": {
+    "type": "int",
+    "default": 20,
+    "description": "去重缓存大小",
+    "hint": "每个用户保留的历史微博缓存条数。缓存越大，去重覆盖范围越广，但内存占用稍增。"
+  },
   "enable_plugin_log": {
     "type": "bool",
     "default": false,

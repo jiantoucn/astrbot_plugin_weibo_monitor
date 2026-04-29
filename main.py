@@ -30,7 +30,7 @@ DEFAULT_HOTSEARCH_TOP_N = 10
 DEFAULT_HOTSEARCH_TEMPLATE = "🔥 微博热搜榜 Top {top_n}\n⏰ 更新时间: {time}\n\n{items}"
 
 
-@register("astrbot_plugin_weibo_monitor", "Sayaka", "定时监控微博用户动态并推送到指定会话。", "v1.13.1", "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor")
+@register("astrbot_plugin_weibo_monitor", "Sayaka", "定时监控微博用户动态并推送到指定会话。", "v1.14.0", "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor")
 class WeiboMonitor(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -93,6 +93,9 @@ class WeiboMonitor(Star):
         self.last_summary_date = self._data.get("last_summary_date", "")
         self.last_hotsearch_time = 0
         self._init_last_hotsearch_time()
+
+        self._similarity_cache: Dict[str, List[Tuple[str, str]]] = {}
+        self._load_similarity_cache()
 
         # 启动后台监控任务
         self.monitor_task = asyncio.create_task(self.run_monitor())
@@ -528,6 +531,106 @@ class WeiboMonitor(Star):
             except:
                 pass
 
+    def _load_similarity_cache(self):
+        cache_file = self.data_dir / "similarity_cache.json"
+        if not cache_file.exists():
+            return
+        try:
+            raw = json.loads(cache_file.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                for uid, entries in raw.items():
+                    if isinstance(entries, list):
+                        self._similarity_cache[uid] = [
+                            (e["hash"], e["text"]) for e in entries if isinstance(e, dict) and "hash" in e and "text" in e
+                        ]
+                self.plugin_logger.debug(f"WeiboMonitor: 已加载相似度缓存，共 {sum(len(v) for v in self._similarity_cache.values())} 条")
+        except Exception as e:
+            self.plugin_logger.warning(f"WeiboMonitor: 加载相似度缓存失败: {e}")
+
+    def _save_similarity_cache(self):
+        cache_file = self.data_dir / "similarity_cache.json"
+        try:
+            serializable = {}
+            for uid, entries in self._similarity_cache.items():
+                serializable[uid] = [{"hash": h, "text": t} for h, t in entries]
+            temp_file = cache_file.with_suffix(".tmp")
+            temp_file.write_text(json.dumps(serializable, ensure_ascii=False, indent=2), encoding="utf-8")
+            temp_file.replace(cache_file)
+        except Exception as e:
+            self.plugin_logger.error(f"WeiboMonitor: 保存相似度缓存失败: {e}")
+            try:
+                if temp_file.exists():
+                    temp_file.unlink()
+            except:
+                pass
+
+    @staticmethod
+    def _compute_simhash(text: str, bits: int = 64) -> int:
+        tokens = list(text)
+        if not tokens:
+            return 0
+        v = [0] * bits
+        for token in tokens:
+            token_hash = hash(token) & ((1 << bits) - 1)
+            for i in range(bits):
+                if (token_hash >> i) & 1:
+                    v[i] += 1
+                else:
+                    v[i] -= 1
+        fingerprint = 0
+        for i in range(bits):
+            if v[i] > 0:
+                fingerprint |= (1 << i)
+        return fingerprint
+
+    @staticmethod
+    def _hamming_distance(hash1: int, hash2: int) -> int:
+        diff = hash1 ^ hash2
+        count = 0
+        while diff:
+            count += 1
+            diff &= diff - 1
+        return count
+
+    @staticmethod
+    def _jaccard_similarity(text1: str, text2: str) -> float:
+        set1 = set(text1)
+        set2 = set(text2)
+        if not set1 and not set2:
+            return 1.0
+        if not set1 or not set2:
+            return 0.0
+        intersection = len(set1 & set2)
+        union = len(set1 | set2)
+        return intersection / union if union > 0 else 0.0
+
+    def _is_duplicate(self, uid: str, new_text: str) -> bool:
+        history = self._similarity_cache.get(uid, [])
+        if not history:
+            return False
+        cache_size = self.config.get("similarity_cache_size", 20)
+        threshold = self.config.get("similarity_threshold", 0.7)
+        new_hash = self._compute_simhash(new_text)
+        for cached_hash, cached_text in history[:cache_size]:
+            hamming = self._hamming_distance(new_hash, cached_hash)
+            if hamming <= 3:
+                similarity = self._jaccard_similarity(new_text, cached_text)
+                if similarity >= threshold:
+                    self.plugin_logger.info(
+                        f"WeiboMonitor: 检测到相似微博（相似度: {similarity:.2%}，汉明距离: {hamming}），已跳过"
+                    )
+                    return True
+        return False
+
+    def _update_similarity_cache(self, uid: str, text: str):
+        cache_size = self.config.get("similarity_cache_size", 20)
+        text_hash = self._compute_simhash(text)
+        if uid not in self._similarity_cache:
+            self._similarity_cache[uid] = []
+        self._similarity_cache[uid].insert(0, (text_hash, text))
+        self._similarity_cache[uid] = self._similarity_cache[uid][:cache_size]
+        self._save_similarity_cache()
+
     async def get_kv_data(self, key: str, default=None):
         """获取持久化键值对"""
         return self._data.get(key, default)
@@ -860,6 +963,14 @@ class WeiboMonitor(Star):
             status_lines.append(f"- 热搜监控：✅ 开启 (每 {hotsearch_interval} 分钟, Top {hotsearch_top_n})")
         else:
             status_lines.append(f"- 热搜监控：❌ 关闭")
+
+        similarity_dedup = self.config.get("enable_similarity_dedup", False)
+        if similarity_dedup:
+            threshold = self.config.get("similarity_threshold", 0.7)
+            cache_size = self.config.get("similarity_cache_size", 20)
+            status_lines.append(f"- 相似度去重：🧪 实验中 (阈值: {threshold:.0%}, 缓存: {cache_size})")
+        else:
+            status_lines.append(f"- 相似度去重：❌ 关闭")
 
         if urls:
             status_lines.append(f"\n📋 监控列表：")
@@ -1402,6 +1513,11 @@ class WeiboMonitor(Star):
             if self._should_skip_by_whitelist(text, whitelist_keywords, current_id):
                 continue
 
+            if self.config.get("enable_similarity_dedup", False) and not force_fetch:
+                if self._is_duplicate(uid, text):
+                    self.plugin_logger.info(f"WeiboMonitor: 微博 {current_id} 与近期推送内容相似，已跳过")
+                    continue
+
             bid = mblog.get("bid")
             if not bid:
                 self.plugin_logger.debug(f"WeiboMonitor: 微博 {current_id} 缺少bid字段，已跳过")
@@ -1418,8 +1534,12 @@ class WeiboMonitor(Star):
                 "created_at": created_at
             })
 
-            if force_fetch:  # 强制获取模式只取第一条
+            if force_fetch:
                 break
+
+        if self.config.get("enable_similarity_dedup", False):
+            for post in new_posts:
+                self._update_similarity_cache(uid, post["text"])
 
         return new_posts
 

@@ -25,6 +25,9 @@
 - `whitelist_keywords` (list): 白名单，只推送包含这些词的微博
 - `send_original` (bool, 默认 true): 推送原创微博
 - `send_forward` (bool, 默认 true): 推送转发微博
+- `enable_similarity_dedup` (bool, 默认 false): 🧪 **实验功能** — 启用相似度去重，自动过滤与近期推送内容相似的微博
+- `similarity_threshold` (number, 默认 0.7): 🧪 相似度阈值，范围 0.0~1.0，值越小去重越激进
+- `similarity_cache_size` (int, 默认 20): 🧪 每个用户的历史微博去重缓存条数
 
 ## 消息格式
 

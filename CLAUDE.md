@@ -1,4 +1,4 @@
-﻿﻿# CLAUDE.md — AstrBot 微博监控插件项目指南
+﻿﻿﻿# CLAUDE.md — AstrBot 微博监控插件项目指南
 
 ## 项目概述
 
@@ -7,7 +7,7 @@ AstrBot 微博监控插件，定时监控微博用户动态并推送到指定会
 
 - **项目名称**: `astrbot_plugin_weibo_monitor`
 - **技术栈**: Python 3.10+, AstrBot 框架, httpx, BeautifulSoup4
-- **唯一源文件**: `main.py`（所有逻辑集中于此，约 1468 行）
+- **唯一源文件**: `main.py`（所有逻辑集中于此，约 1589 行）
 
 ## 详细文档索引
 

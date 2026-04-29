@@ -1,40 +1,28 @@
-# 核心类 WeiboMonitor 生命周期
+# WeiboMonitor 生命周期
 
-## 生命周期概览
+## 初始化顺序 (`__init__`)
 
-1. `__init__`: 初始化配置、HTTP 客户端、数据目录、日志、持久化数据，启动后台监控任务
-2. 后台监控任务 (`run_monitor`): 异步循环，定时检查微博和热搜
-3. `terminate`: 停止监控任务，关闭 HTTP 客户端
+1. 加载配置 → 创建数据目录 (`data_dir`, `logs_dir`)
+2. 初始化日志 (`setup_logging`) → 检查 Cookie 配置
+3. 创建 httpx 客户端（20s 超时、2 次重试、5 并发信号量）
+4. 兼容旧路径迁移 → 加载持久化数据 (`monitor_data.json`)
+5. 初始化热搜防刷屏时间 → 加载相似度缓存 (`similarity_cache.json`)
+6. 启动后台监控任务 (`run_monitor`)
 
-## `__init__` 初始化顺序
+## 主循环 (`run_monitor`)
 
-```python
-self.config = config or {}
-self.data_dir = StarTools.get_data_dir()
-self.data_file = self.data_dir / "monitor_data.json"
-self.logs_dir = self.data_dir / "logs"
-self.setup_logging()
-self.client = httpx.AsyncClient(...)
-self._data = self._load_data()
-self._init_last_hotsearch_time()
-self.monitor_task = asyncio.create_task(self.run_monitor())
-```
+每 60 秒迭代一次，依次检查：
 
-## `run_monitor` 主循环
+1. **每日总结**: 是否到达 `daily_summary_time`
+2. **热搜监控**: 是否超过 `hotsearch_interval`
+3. **微博监控**: 是否超过 `check_interval`（含随机抖动）→ 逐账号检查 → 推送
 
-主循环每 60 秒迭代一次，依次检查：
+错误处理：连续错误时指数退避（最大 5 分钟），正常运行后自动恢复。
 
-1. **每日总结**: 判断是否到达设定的总结推送时间
-2. **热搜监控**: 判断 `hotsearch_interval` 是否已过，到达后获取并推送热搜
-3. **微博监控**: 判断 `check_interval`（含随机抖动）是否已过，到达后逐一检查监控列表
+## 终止 (`terminate`)
 
-异常处理采用指数退避策略：连续错误时自动延长等待时间（最大 5 分钟）。
+取消后台任务 → 关闭 httpx 客户端。
 
-## 防重载刷屏机制
+## 防重载刷屏
 
-`_init_last_hotsearch_time()` 在插件初始化时执行：
-
-1. 扫描今天和昨天的每日日志文件（`logs/YYYYMMDD.log`）
-2. 检查 `self._data["last_hotsearch_push_time"]` 持久化记录
-3. 若 30 分钟内有推送记录，计算 `elapsed` 并回退 `last_hotsearch_time`
-4. 使 `run_monitor` 中的 interval 判断在等待足够时间后才触发首次推送
+`_init_last_hotsearch_time()` 扫描日志和持久化数据，若 30 分钟内已推送热搜则回退计时器，避免重载后立即刷屏。
