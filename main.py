@@ -14,6 +14,7 @@ from urllib.parse import quote
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.star import Context, Star, register, StarTools
 from bs4 import BeautifulSoup
+import astrbot.api.message_components as Comp
 
 # 常量定义
 DEFAULT_CHECK_INTERVAL = 10  # 默认检查间隔（分钟）
@@ -30,7 +31,7 @@ DEFAULT_HOTSEARCH_TOP_N = 10
 DEFAULT_HOTSEARCH_TEMPLATE = "🔥 微博热搜榜 Top {top_n}\n⏰ 更新时间: {time}\n\n{items}"
 
 
-@register("astrbot_plugin_weibo_monitor", "Sayaka", "定时监控微博用户动态并推送到指定会话，支持按会话分组订阅不同博主。", "v1.15.0", "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor")
+@register("astrbot_plugin_weibo_monitor", "Sayaka", "定时监控微博用户动态并推送到指定会话，支持按会话分组订阅不同博主。", "v1.16.2", "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor")
 class WeiboMonitor(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -46,6 +47,9 @@ class WeiboMonitor(Star):
         self.logs_dir = self.data_dir / "logs"
         if not self.logs_dir.exists():
             self.logs_dir.mkdir(parents=True, exist_ok=True)
+        self.temp_images_dir = self.data_dir / "temp_images"
+        if not self.temp_images_dir.exists():
+            self.temp_images_dir.mkdir(parents=True, exist_ok=True)
             
         # 初始化日志
         self.plugin_logger = logging.getLogger("astrbot_plugin_weibo_monitor")
@@ -569,6 +573,166 @@ class WeiboMonitor(Star):
         await self.client.aclose()
         self.plugin_logger.info("WeiboMonitor 插件已停止")
 
+    def _extract_image_urls(self, mblog: dict) -> List[str]:
+        """从微博博文数据中提取高清图片 URL 列表"""
+        image_urls = []
+        pics = mblog.get("pics") or []
+        for pic in pics:
+            if not isinstance(pic, dict):
+                continue
+            large = pic.get("large") or {}
+            url = large.get("url") or pic.get("url")
+            if url:
+                if url.startswith("//"):
+                    url = "https:" + url
+                image_urls.append(url)
+        return image_urls
+
+    async def _download_image(self, url: str, save_name: str) -> Optional[str]:
+        """下载图片到临时目录，返回本地文件路径"""
+        try:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/604.1",
+                "Referer": "https://m.weibo.cn/",
+            }
+            cookie = self.config.get("weibo_cookie", "")
+            if cookie:
+                headers["Cookie"] = cookie
+            async with self._request_semaphore:
+                resp = await self.client.get(url, headers=headers)
+                if resp.status_code == 200 and len(resp.content) > 0:
+                    save_path = self.temp_images_dir / save_name
+                    save_path.write_bytes(resp.content)
+                    return str(save_path)
+                else:
+                    self.plugin_logger.warning(f"下载图片失败，状态码: {resp.status_code}，URL: {url}")
+                    return None
+        except Exception as e:
+            self.plugin_logger.error(f"下载图片出错: {e}，URL: {url}")
+            return None
+
+    def _cleanup_temp_images(self):
+        """清理临时图片目录中超过 1 小时的文件"""
+        try:
+            import time
+            now = time.time()
+            for f in self.temp_images_dir.iterdir():
+                if f.is_file() and now - f.stat().st_mtime > 3600:
+                    f.unlink()
+        except Exception as e:
+            self.plugin_logger.debug(f"清理临时图片出错: {e}")
+
+    def _format_post_text(self, post: dict, msg_format: str) -> str:
+        """格式化微博文本内容"""
+        return msg_format.format(
+            name=post.get("username", "未知用户"),
+            weibo=post["text"],
+            link=post["link"],
+        )
+
+    async def _download_post_images(self, post: dict) -> List[str]:
+        """下载微博图片并返回本地路径列表"""
+        image_urls = post.get("image_urls", [])
+        max_images = self.config.get("max_images_per_post", 0)
+        if max_images > 0:
+            image_urls = image_urls[:max_images]
+
+        local_paths = []
+        for idx, url in enumerate(image_urls):
+            ext = "jpg"
+            if ".png" in url.lower():
+                ext = "png"
+            elif ".gif" in url.lower():
+                ext = "gif"
+            elif ".webp" in url.lower():
+                ext = "webp"
+            uid_part = post.get("link", "unknown").split("/")[-1] if post.get("link") else "unknown"
+            save_name = f"{uid_part}_{idx}.{ext}"
+            local_path = await self._download_image(url, save_name)
+            if local_path:
+                local_paths.append(local_path)
+        return local_paths
+
+    async def _send_post_to_targets(self, post: dict, msg_format: str,
+                                     targets: List[str], skip_log: bool = False) -> int:
+        """发送单条微博到指定目标。
+        返回实际发送的图片数量。
+        """
+        if not skip_log:
+            self._log_to_daily_file(post)
+
+        text_content = self._format_post_text(post, msg_format)
+        image_paths = await self._download_post_images(post)
+
+        chain = MessageChain().message(text_content)
+        for img_path in image_paths:
+            chain.chain.append(Comp.Image(file=img_path))
+
+        for target in targets:
+            try:
+                await self.context.send_message(target, chain)
+            except Exception as e:
+                self.plugin_logger.error(f"WeiboMonitor: 推送到 {target} 失败: {e}")
+
+        return len(image_paths)
+
+    @staticmethod
+    def _parse_bid_from_url(url: str) -> Optional[Tuple[str, Optional[str]]]:
+        """从微博链接中解析 bid 和可选的 uid。
+        支持格式：
+        - https://weibo.com/uid/bid
+        - https://m.weibo.cn/detail/bid
+        - https://m.weibo.cn/status/bid
+        - https://weibo.com/detail/bid
+        返回 (bid, uid) 或 None
+        """
+        url = url.strip()
+        match = re.search(r"weibo\.(com|cn)/(\d+)/([A-Za-z0-9]+)", url)
+        if match:
+            return (match.group(3), match.group(2))
+        match2 = re.search(r"weibo\.(com|cn)/(detail|status)/([A-Za-z0-9]+)", url)
+        if match2:
+            return (match2.group(3), None)
+        match3 = re.search(r"weibo\.(com|cn)/[^/]+/([A-Za-z0-9]+)", url)
+        if match3:
+            return (match3.group(2), None)
+        return None
+
+    async def _fetch_single_weibo(self, bid: str) -> Optional[dict]:
+        """通过 bid 抓取单条微博详情，返回 post dict 或 None"""
+        try:
+            api_url = f"{WEIBO_MOBILE_BASE}/statuses/show?id={bid}"
+            async with self._request_semaphore:
+                resp = await self.client.get(api_url, headers=self.get_headers())
+                if resp.status_code != 200:
+                    self.plugin_logger.warning(f"获取单条微博失败，状态码: {resp.status_code}，bid: {bid}")
+                    return None
+                data = resp.json()
+                if data.get("ok") != 1:
+                    self.plugin_logger.warning(f"获取单条微博数据异常，bid: {bid}")
+                    return None
+                mblog = data.get("data")
+                if not mblog or not isinstance(mblog, dict):
+                    return None
+
+                uid = (mblog.get("user") or {}).get("idstr") or str((mblog.get("user") or {}).get("id", ""))
+                username = (mblog.get("user") or {}).get("screen_name", "未知用户")
+                text = self.clean_text(mblog.get("text", ""))
+                link = f"{WEIBO_WEB_BASE}/{uid}/{bid}" if uid else f"{WEIBO_WEB_BASE}/detail/{bid}"
+                created_at = self._parse_weibo_time(mblog.get("created_at", ""))
+                image_urls = self._extract_image_urls(mblog)
+
+                return {
+                    "text": text,
+                    "link": link,
+                    "username": username,
+                    "created_at": created_at,
+                    "image_urls": image_urls,
+                }
+        except Exception as e:
+            self.plugin_logger.error(f"抓取单条微博出错: {e}，bid: {bid}")
+            return None
+
     def get_targets(self) -> List[str]:
         targets_raw = self.config.get("target_conversation_id", [])
         if isinstance(targets_raw, str):
@@ -1029,6 +1193,55 @@ class WeiboMonitor(Star):
         else:
             yield event.plain_result("❌ 发送失败，所有目标均未发送成功。")
 
+    @filter.command("weibo_get")
+    async def weibo_get(self, event: AstrMessageEvent, url: str = ""):
+        """抓取并推送指定链接的微博"""
+        message_str: str = event.message_str or ""
+        if message_str:
+            parts = message_str.split(maxsplit=1)
+            if len(parts) > 1:
+                url = parts[1].strip()
+
+        if not url:
+            yield event.plain_result("❌ 请提供微博链接。\n用法: /weibo_get <微博链接>\n\n支持格式:\n- https://weibo.com/uid/bid\n- https://m.weibo.cn/detail/bid\n- https://m.weibo.cn/status/bid")
+            return
+
+        if "weibo.com" not in url and "weibo.cn" not in url:
+            yield event.plain_result("❌ 请提供正确的微博链接。\n支持域名: weibo.com 或 weibo.cn")
+            return
+
+        parsed = self._parse_bid_from_url(url)
+        if not parsed:
+            yield event.plain_result("❌ 无法从链接中解析微博 ID，请检查链接格式是否正确。\n\n支持格式:\n- https://weibo.com/uid/bid\n- https://m.weibo.cn/detail/bid\n- https://m.weibo.cn/status/bid")
+            return
+
+        bid, uid = parsed
+        if not bid:
+            yield event.plain_result("❌ 无法从链接中解析微博 ID，请确认链接包含有效的微博 bid。")
+            return
+
+        yield event.plain_result("🔍 正在抓取微博内容...")
+
+        post = await self._fetch_single_weibo(bid)
+        if not post:
+            yield event.plain_result("❌ 无法获取该微博内容，可能原因:\n- 微博已被删除或设为私密\n- Cookie 已失效（请使用 /weibo_verify 检查）\n- 链接格式不正确")
+            return
+
+        if not post.get("text") and not post.get("image_urls"):
+            yield event.plain_result("❌ 该微博内容为空。")
+            return
+
+        targets = self.get_targets()
+        if not targets:
+            targets = [event.unified_msg_origin]
+
+        msg_format = self.message_format
+        actual_images = await self._send_post_to_targets(post, msg_format, targets, skip_log=True)
+
+        image_info = f"，含 {actual_images} 张图片" if actual_images > 0 else ""
+
+        yield event.plain_result(f"✅ 已向 {len(targets)} 个目标推送 {post.get('username')} 的微博{image_info}。")
+
     @property
     def message_format(self) -> str:
         """获取并格式化消息模板"""
@@ -1057,6 +1270,7 @@ class WeiboMonitor(Star):
         
         last_check_time = 0
         error_backoff = 60
+        last_cleanup_time = 0
 
         while self.running:
             try:
@@ -1069,6 +1283,10 @@ class WeiboMonitor(Star):
                     self._consecutive_errors = 0
                     error_backoff = 60
                     self.plugin_logger.info("WeiboMonitor: 连续错误已清除，恢复正常监控频率")
+                
+                if asyncio.get_event_loop().time() - last_cleanup_time >= 3600:
+                    self._cleanup_temp_images()
+                    last_cleanup_time = asyncio.get_event_loop().time()
                 
                 # 1. 检查是否需要发送每日总结
                 summary_time = self.config.get("daily_summary_time", "08:00")
@@ -1235,39 +1453,19 @@ class WeiboMonitor(Star):
 
     async def _send_new_posts(self, new_posts: List[dict], targets: List[str], msg_format: str, 
                                fallback_target: str = None, skip_log: bool = False):
-        """发送新微博到指定目标"""
+        """发送新微博到指定目标（文本与图片分别独立发送，兼容所有平台）"""
         if not targets and fallback_target:
             targets = [fallback_target]
         
+        if not targets:
+            self.plugin_logger.debug("WeiboMonitor: 没有配置推送目标，跳过推送")
+            return
+
         for post in new_posts:
-            # 记录到每日日志
-            self._log_to_daily_file(post, skip_log)
-            
-            content = msg_format.format(
-                name=post.get("username", "未知用户"),
-                weibo=post["text"],
-                link=post["link"],
+            await self._send_post_to_targets(post, msg_format, targets, skip_log)
+            self.plugin_logger.info(
+                f"WeiboMonitor: 已推送 {post.get('username')} 的更新到 {len(targets)} 个目标"
             )
-            chain = MessageChain().message(content)
-            
-            send_targets = targets
-            
-            if not send_targets:
-                self.plugin_logger.debug(f"WeiboMonitor: 没有配置推送目标，跳过推送 {post.get('username')} 的微博")
-                continue
-                
-            sent_count = 0
-            for target in send_targets:
-                try:
-                    await self.context.send_message(target, chain)
-                    sent_count += 1
-                except Exception as e:
-                    self.plugin_logger.error(f"WeiboMonitor: 推送到目标 {target} 时出错: {e}")
-            
-            if sent_count > 0:
-                self.plugin_logger.info(
-                    f"WeiboMonitor: 已向 {sent_count}/{len(send_targets)} 个目标推送 {post.get('username')} 的更新"
-                )
 
     async def parse_uid(self, url: str) -> Optional[str]:
         """
@@ -1442,7 +1640,8 @@ class WeiboMonitor(Star):
                             "text": text,
                             "link": link,
                             "username": username,
-                            "created_at": created_at
+                            "created_at": created_at,
+                            "image_urls": self._extract_image_urls(mblog),
                         }
                         self._log_to_daily_file(post)
             else:
@@ -1497,12 +1696,14 @@ class WeiboMonitor(Star):
             
             created_at_raw = mblog.get("created_at")
             created_at = self._parse_weibo_time(created_at_raw)
+            image_urls = self._extract_image_urls(mblog)
             
             new_posts.append({
                 "text": text, 
                 "link": link, 
                 "username": username,
-                "created_at": created_at
+                "created_at": created_at,
+                "image_urls": image_urls,
             })
 
             if force_fetch:

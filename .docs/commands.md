@@ -12,3 +12,4 @@
 | `/weibo_summary` | 手动触发昨日总结 | 读取昨日日志文件，统计并推送 |
 | `/weibo_export` | 导出配置 | JSON 序列化 + Base64 编码 |
 | `/weibo_import <str>` | 导入配置 | 从 `event.message_str` 提取完整参数（避免框架按空格截断），支持 Base64 或直接 JSON，键值合并更新 |
+| `/weibo_get <链接>` | 抓取并推送指定链接微博 | 解析链接获取 bid，调用 `_fetch_single_weibo(bid)` 抓取详情，构建图文消息链推送 |

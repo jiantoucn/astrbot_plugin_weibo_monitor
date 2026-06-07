@@ -61,6 +61,12 @@
     "description": "【全局】推送消息格式",
     "hint": "支持变量: {name} (用户名), {weibo} (内容), {link} (链接)"
   },
+  "max_images_per_post": {
+    "type": "int",
+    "default": 0,
+    "description": "【全局】每条微博最多获取图片数",
+    "hint": "0 表示获取所有图片。设置为正整数则限制每条微博最多推送该数量的图片。图片将以最高清质量下载并与正文一起推送。"
+  },
   "filter_keywords": {
     "type": "list",
     "item_type": "string",

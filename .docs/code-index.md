@@ -29,6 +29,14 @@
 
 `_load_data`, `_save_data`, `get_kv_data`, `put_kv_data`
 
+## 图片处理
+
+`_extract_image_urls`, `_download_image`, `_cleanup_temp_images`, `_format_post_text`, `_download_post_images`, `_send_post_to_targets`
+
+## 单条微博抓取
+
+`_parse_bid_from_url`, `_fetch_single_weibo`
+
 ## 请求头与生命周期
 
 `get_headers`, `terminate`, `get_targets`
