@@ -31,7 +31,7 @@ DEFAULT_HOTSEARCH_TOP_N = 10
 DEFAULT_HOTSEARCH_TEMPLATE = "🔥 微博热搜榜 Top {top_n}\n⏰ 更新时间: {time}\n\n{items}"
 
 
-@register("astrbot_plugin_weibo_monitor", "Sayaka", "定时监控微博用户动态并推送到指定会话，支持按会话分组订阅不同博主。", "v1.16.2", "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor")
+@register("astrbot_plugin_weibo_monitor", "Sayaka", "定时监控微博用户动态并推送到指定会话，支持按会话分组订阅不同博主。", "v1.16.3", "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor")
 class WeiboMonitor(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -56,11 +56,6 @@ class WeiboMonitor(Star):
         self.plugin_logger.setLevel(logging.DEBUG)
         self.plugin_logger.propagate = False # 不向上冒泡到 root logger
         self.setup_logging()
-        
-        # 检查Cookie是否配置
-        cookie = self.config.get("weibo_cookie", "")
-        if not cookie:
-            self.plugin_logger.warning("WeiboMonitor: 未配置微博Cookie，插件无法正常工作！请在插件设置中填写weibo_cookie。")
         
         # 配置HTTP客户端，添加重试、超时和连接池设置
         self.limits = httpx.Limits(
@@ -93,6 +88,15 @@ class WeiboMonitor(Star):
                 self.plugin_logger.error(f"WeiboMonitor: 迁移数据失败: {e}")
 
         self._data = self._load_data()
+        
+        # 检查Cookie是否配置，若框架配置为空则尝试从 _data 兜底恢复
+        if not self.config.get("weibo_cookie", ""):
+            backup_cookie = self._data.get("_backup_weibo_cookie", "")
+            if backup_cookie:
+                self.config["weibo_cookie"] = backup_cookie
+                self.plugin_logger.info("WeiboMonitor: 从持久化数据中恢复了微博 Cookie")
+            else:
+                self.plugin_logger.warning("WeiboMonitor: 未配置微博Cookie，插件无法正常工作！请在插件设置中填写weibo_cookie。")
         
         self.last_summary_date = self._data.get("last_summary_date", "")
         self.last_hotsearch_time = 0
@@ -869,6 +873,11 @@ class WeiboMonitor(Star):
             except:
                 pass
 
+            # 兜底：如果导入的配置包含 Cookie，同步写入 _data 持久化文件
+            if "weibo_cookie" in new_config:
+                self._data["_backup_weibo_cookie"] = new_config["weibo_cookie"]
+                self._save_data()
+
             yield event.plain_result(
                 f"✅ 成功导入 {count} 项配置！\n"
                 f"注意：部分配置（如检查间隔）可能需要重启插件后才能完全生效。导入后请先刷新插件后台页面，否则配置无法显示。"
@@ -939,6 +948,12 @@ class WeiboMonitor(Star):
         except Exception as e:
             self.plugin_logger.error(f"WeiboMonitor: 保存配置失败: {e}")
             saved = False
+
+        # 兜底：将 Cookie 写入 _data 持久化文件，防止框架配置保存失败时丢失
+        self._data["_backup_weibo_cookie"] = cookie
+        self._save_data()
+        if not saved:
+            saved = True
 
         yield event.plain_result("🔄 Cookie 已更新，正在验证有效性...")
         try:
