@@ -31,7 +31,7 @@ DEFAULT_HOTSEARCH_TOP_N = 10
 DEFAULT_HOTSEARCH_TEMPLATE = "🔥 微博热搜榜 Top {top_n}\n⏰ 更新时间: {time}\n\n{items}"
 
 
-@register("astrbot_plugin_weibo_monitor", "Sayaka", "定时监控微博用户动态并推送到指定会话，支持按会话分组订阅不同博主。", "v1.16.3", "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor")
+@register("astrbot_plugin_weibo_monitor", "Sayaka", "定时监控微博用户动态并推送到指定会话，支持按会话分组订阅不同博主。", "v1.16.4", "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor")
 class WeiboMonitor(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -660,6 +660,7 @@ class WeiboMonitor(Star):
     async def _send_post_to_targets(self, post: dict, msg_format: str,
                                      targets: List[str], skip_log: bool = False) -> int:
         """发送单条微博到指定目标。
+        文字与图片分别独立发送，解决飞书适配器图文混合消息文字丢失问题（统一应用于所有平台）。
         返回实际发送的图片数量。
         """
         if not skip_log:
@@ -668,13 +669,19 @@ class WeiboMonitor(Star):
         text_content = self._format_post_text(post, msg_format)
         image_paths = await self._download_post_images(post)
 
-        chain = MessageChain().message(text_content)
+        # 文字与图片分别独立发送，解决飞书适配器图文混合消息文字丢失问题。
+        # 所有平台统一采用此方式。
+        text_chain = MessageChain().message(text_content)
+
+        img_chain = MessageChain()
         for img_path in image_paths:
-            chain.chain.append(Comp.Image(file=img_path))
+            img_chain.chain.append(Comp.Image(file=img_path))
 
         for target in targets:
             try:
-                await self.context.send_message(target, chain)
+                await self.context.send_message(target, text_chain)
+                if image_paths:
+                    await self.context.send_message(target, img_chain)
             except Exception as e:
                 self.plugin_logger.error(f"WeiboMonitor: 推送到 {target} 失败: {e}")
 
