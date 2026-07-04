@@ -1,5 +1,11 @@
 # 更新日志 (CHANGELOG)
 
+- **v1.17.0**:
+  - **新功能**: 统一推送目标配置。将 `target_conversation_id`（全局广播）和 `subscription_mappings`（订阅过滤）合并为单一的 `subscription_mappings` 配置项。使用 `*` 表示全局广播（该会话接收所有博主推送 + 热搜 + 每日总结），使用具体 UID 表示只接收指定博主。若只写会话 ID 而省略冒号（如 `群A`），自动补全为 `*`。
+  - **迁移**: 首次启动时同步自动将旧版 `target_conversation_id` 中的全局目标迁移到 `subscription_mappings`（追加 `会话ID: *`），确保 run_monitor 启动前完成。
+  - **重构**: 新增 `_iter_mappings()` 统一解析 subscription_mappings，消除三处重复解析逻辑。`_get_targets_for_uid` 路由逻辑大幅简化，不再需要"全局广播排除已订阅会话"的复杂判断。
+  - **样式**: 移除所有配置项 description 的 `【全局】`/`【分组】` 前缀。
+  - **破坏性变更**: `target_conversation_id` 已废弃。现有配置会自动迁移，新配置请直接使用 `subscription_mappings`。
 - **v1.16.4**:
   - **修复**: 飞书平台微博推送时文字丢失的问题。将文字与图片拆分为两条独立消息发送，绕过 AstrBot 飞书适配器处理图文混合消息链时的列表引用 bug。所有平台（QQ、KOOK、飞书等）统一采用此方式，文字消息在前、图片消息在后。
 - **v1.16.3**:

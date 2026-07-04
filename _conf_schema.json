@@ -3,157 +3,157 @@
     "type": "list",
     "item_type": "string",
     "default": [],
-    "description": "【全局】微博用户主页链接",
+    "description": "微博用户主页链接",
     "hint": "可以填写多个，例如: https://weibo.com/u/1234567890"
+  },
+  "subscription_mappings": {
+    "type": "list",
+    "item_type": "string",
+    "default": [],
+    "description": "推送目标与订阅映射（统一配置）",
+    "hint": "一行一个会话。* = 全部，具体UID = 只收指定。多个UID用英文逗号分隔。示例: group_A: *（全部），group_B: 1234567890（指定），group_C: 1234567890, 9876543210（多个）。用 /weibo_umo 获取会话ID。"
   },
   "weibo_cookie": {
     "type": "string",
     "default": "",
-    "description": "【全局】微博 Cookie",
+    "description": "微博 Cookie",
     "hint": "必须配置微博 Cookie 才能正常抓取数据，确保稳定性"
   },
   "check_interval": {
     "type": "int",
     "default": 10,
-    "description": "【全局】检查间隔（分钟）"
+    "description": "检查间隔（分钟）"
   },
   "check_interval_jitter": {
     "type": "int",
     "default": 2,
-    "description": "【全局】检查间隔随机浮动（分钟）",
+    "description": "检查间隔随机浮动（分钟）",
     "hint": "实际检查间隔会在 [间隔-浮动, 间隔+浮动] 范围内随机选择。例如：间隔10，浮动2，则随机在 8-12 分钟内检查一次。"
   },
   "request_interval": {
     "type": "int",
     "default": 5,
-    "description": "【全局】账号请求间隔（秒）",
+    "description": "账号请求间隔（秒）",
     "hint": "多个账号间抓取的间隔时间，避免请求过快被拦截"
   },
   "request_interval_jitter": {
     "type": "int",
     "default": 1,
-    "description": "【全局】请求间隔随机浮动（秒）",
+    "description": "请求间隔随机浮动（秒）",
     "hint": "实际请求间隔会在 [间隔-浮动, 间隔+浮动] 范围内随机选择。设置为0则不使用随机性。"
   },
   "target_conversation_id": {
     "type": "list",
     "item_type": "string",
     "default": [],
-    "description": "【全局】推送目标会话 ID",
-    "hint": "可以填写多个。通过指令 /weibo_umo 获取当前会话 ID"
-  },
-  "subscription_mappings": {
-    "type": "list",
-    "item_type": "string",
-    "default": [],
-    "description": "【分组】会话订阅映射",
-    "hint": "格式: 会话ID: uid或链接,uid或链接。每行一个会话的订阅配置。\n示例: group_abc123: 1234567890, https://weibo.com/u/9876543210\n配置后，该会话只接收已订阅博主的推送；未配置的全局目标仍接收全部推送。"
+    "description": "推送目标会话 ID（已废弃，首次启动自动迁移至 subscription_mappings）",
+    "hint": "此字段已废弃。请使用 subscription_mappings 统一管理推送目标。旧配置将在首次启动时自动迁移：每个全局目标会被追加为 会话ID: *。"
   },
   "cookie_notification_target": {
     "type": "string",
     "default": "",
-    "description": "【全局】Cookie 失效通知目标",
-    "hint": "可选。如果不填写，则向 '推送目标会话 ID' 中所有的群/账号发送通知；如果填写，则仅向该 ID 发送通知。"
+    "description": "Cookie 失效通知目标",
+    "hint": "可选。如果不填写，则向 subscription_mappings 中所有已配置的会话发送通知；如果填写，则仅向该 ID 发送通知。"
   },
   "message_format": {
     "type": "string",
     "default": "🔔 {name} 发微博啦！\n\n{weibo}\n\n链接: {link}",
-    "description": "【全局】推送消息格式",
+    "description": "推送消息格式",
     "hint": "支持变量: {name} (用户名), {weibo} (内容), {link} (链接)"
   },
   "max_images_per_post": {
     "type": "int",
     "default": 0,
-    "description": "【全局】每条微博最多获取图片数",
-    "hint": "0 表示获取所有图片。设置为正整数则限制每条微博最多推送该数量的图片。图片将以最高清质量下载并与正文一起推送。"
+    "description": "每条微博最多获取图片数",
+    "hint": "0 表示获取所有图片。设置为正整数则限制每条微博最多推送该数量的图片。"
   },
   "filter_keywords": {
     "type": "list",
     "item_type": "string",
     "default": [],
-    "description": "【全局】屏蔽词列表",
+    "description": "屏蔽词列表",
     "hint": "如果微博正文包含这些词，将不会被推送。例如: 推广, 广告"
   },
   "whitelist_keywords": {
     "type": "list",
     "item_type": "string",
     "default": [],
-    "description": "【全局】关键词白名单",
+    "description": "关键词白名单",
     "hint": "只有微博正文包含这些关键词时才会推送。为空时不限制。"
   },
   "send_original": {
     "type": "bool",
     "default": true,
-    "description": "【全局】是否推送原创微博"
+    "description": "是否推送原创微博"
   },
   "send_forward": {
     "type": "bool",
     "default": true,
-    "description": "【全局】是否推送转发微博"
+    "description": "是否推送转发微博"
   },
   "enable_plugin_log": {
     "type": "bool",
     "default": false,
-    "description": "【全局】开启运行日志 (plugin.log)",
+    "description": "开启运行日志 (plugin.log)",
     "hint": "记录插件运行详细情况，方便排查问题"
   },
   "plugin_log_max_size": {
     "type": "int",
     "default": 1,
-    "description": "【全局】运行日志文件最大大小 (MB)"
+    "description": "运行日志文件最大大小 (MB)"
   },
   "enable_daily_log": {
     "type": "bool",
     "default": false,
-    "description": "【全局】开启每日推送记录",
+    "description": "开启每日推送记录",
     "hint": "记录每天推送的微博动态与热搜，以便进行统计或分析"
   },
   "enable_daily_summary": {
     "type": "bool",
     "default": false,
-    "description": "【全局】开启每日发送总结",
+    "description": "开启每日发送总结",
     "hint": "每天定时推送前一天的监控统计信息（含微博动态与热搜推送次数）"
   },
   "daily_summary_time": {
     "type": "string",
     "default": "08:00",
-    "description": "【全局】每日总结推送时间",
+    "description": "每日总结推送时间",
     "hint": "24小时制，例如: 08:00"
   },
   "enable_hotsearch": {
     "type": "bool",
     "default": false,
-    "description": "【全局】开启微博热搜监控",
+    "description": "开启微博热搜监控",
     "hint": "开启后定时推送微博热搜榜，无需 Cookie 即可使用"
   },
   "hotsearch_interval": {
     "type": "int",
     "default": 60,
-    "description": "【全局】热搜推送间隔（分钟）",
+    "description": "热搜推送间隔（分钟）",
     "hint": "默认 60 分钟（1 小时），值越小推送越频繁"
   },
   "hotsearch_top_n": {
     "type": "int",
     "default": 10,
-    "description": "【全局】推送热搜前 N 条",
+    "description": "推送热搜前 N 条",
     "hint": "默认 10 条，可设置为 5、15、20 等"
   },
   "hotsearch_filter_ads": {
     "type": "bool",
     "default": true,
-    "description": "【全局】过滤热搜广告位",
+    "description": "过滤热搜广告位",
     "hint": "开启后自动过滤热搜榜中的广告/推广条目"
   },
   "hotsearch_show_link": {
     "type": "bool",
     "default": true,
-    "description": "【全局】显示热搜条目链接",
+    "description": "显示热搜条目链接",
     "hint": "开启后每条热搜下方会附带微博搜索链接，关闭则仅显示标题和序号"
   },
   "hotsearch_message_format": {
     "type": "string",
     "default": "🔥 微博热搜榜 Top {top_n}\n⏰ 更新时间: {time}\n\n{items}",
-    "description": "【全局】热搜推送消息格式",
+    "description": "热搜推送消息格式",
     "hint": "支持变量: {top_n} (热搜数量), {time} (更新时间), {items} (热搜条目列表)"
   }
 }

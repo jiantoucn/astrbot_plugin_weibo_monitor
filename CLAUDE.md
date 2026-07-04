@@ -58,7 +58,7 @@ async def handler(self, event: AstrMessageEvent, arg: str = ""):
 - **并发控制**: `asyncio.Semaphore(5)` 限制并发 HTTP 请求
 - **随机抖动**: 检查间隔和请求间隔均有 ±jitter 防反爬
 - **原子写入**: `_save_data` 使用 temp file + replace 模式
-- **订阅分组**: `_get_targets_for_uid` 按 UID 路由到不同会话
+- **订阅分组（v1.17.0+ 统一配置）**: `subscription_mappings` 是唯一的推送目标配置，`*` 表示全局广播（接收所有博主 + 热搜 + 总结），具体 UID 表示只接收指定博主。旧版 `target_conversation_id` 在首次启动时自动迁移（`_migrate_config_v2`），`get_targets()` 只返回 `*` 会话，`_get_targets_for_uid(uid)` 返回匹配该 UID 的所有会话。
 - **Cookie 兜底**: 持久化数据中备份 Cookie，框架配置丢失时自动恢复（启动时检测 → 从持久化数据恢复）
 - **热搜防刷屏**: 插件重载时若 30 分钟内已推送过热搜，自动跳过首次推送
 
@@ -81,7 +81,6 @@ async def handler(self, event: AstrMessageEvent, arg: str = ""):
 - 日志使用 `self.plugin_logger` 而非 `logging.getLogger()`
 - 配置读取使用 `self.config.get(key, default)` 提供默认值
 - 异常处理要全面，单个账号失败不应影响其他账号
-- `_conf_schema.json` 中配置项 description 必须以 `【全局】` 或 `【分组】` 前缀开头
 
 ## 详细文档索引
 

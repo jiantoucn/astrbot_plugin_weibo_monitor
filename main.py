@@ -31,14 +31,14 @@ DEFAULT_HOTSEARCH_TOP_N = 10
 DEFAULT_HOTSEARCH_TEMPLATE = "🔥 微博热搜榜 Top {top_n}\n⏰ 更新时间: {time}\n\n{items}"
 
 
-@register("astrbot_plugin_weibo_monitor", "Sayaka", "定时监控微博用户动态并推送到指定会话，支持按会话分组订阅不同博主。", "v1.16.4", "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor")
+@register("astrbot_plugin_weibo_monitor", "Sayaka", "定时监控微博用户动态并推送到指定会话，支持按会话分组订阅不同博主。", "v1.17.0", "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor")
 class WeiboMonitor(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
         self.config = config or {}
         self.monitor_task: Optional[asyncio.Task] = None
         self.cookie_invalid_notified = False # cookie 失效是否已通知
-        
+
         # 确保数据目录存在
         self.data_dir = StarTools.get_data_dir()
         if not self.data_dir.exists():
@@ -88,7 +88,10 @@ class WeiboMonitor(Star):
                 self.plugin_logger.error(f"WeiboMonitor: 迁移数据失败: {e}")
 
         self._data = self._load_data()
-        
+
+        # 迁移旧版配置：将 target_conversation_id 合并到 subscription_mappings（同步，确保在 run_monitor 前完成）
+        self._migrate_config_v2()
+
         # 检查Cookie是否配置，若框架配置为空则尝试从 _data 兜底恢复
         if not self.config.get("weibo_cookie", ""):
             backup_cookie = self._data.get("_backup_weibo_cookie", "")
@@ -549,6 +552,54 @@ class WeiboMonitor(Star):
         self._data[key] = value
         self._save_data()
 
+    def _migrate_config_v2(self):
+        """将 target_conversation_id 迁移到统一的 subscription_mappings 格式。
+        核心迁移逻辑同步执行（修改 self.config），确保 run_monitor 启动前已完成。
+        save_config 持久化抛后异步执行，失败不影响运行。
+        """
+        targets = self.get_targets_legacy()
+        if not targets:
+            return
+
+        mappings = self.config.get("subscription_mappings", [])
+        subscribed = self._get_all_subscribed_sessions()
+
+        added = False
+        for target in targets:
+            if target not in subscribed:
+                mappings.append(f"{target}: *")
+                added = True
+                self.plugin_logger.info(f"配置迁移: {target} → {target}: *")
+
+        if added:
+            self.config["subscription_mappings"] = mappings
+            self.config["target_conversation_id"] = []
+            # 异步持久化到框架
+            asyncio.ensure_future(self._persist_migrated_config())
+
+    async def _persist_migrated_config(self):
+        """异步持久化迁移后的配置到框架存储。"""
+        try:
+            if hasattr(self.context, "config_manager") and hasattr(self.context.config_manager, "save_config"):
+                self.context.config_manager.save_config()
+        except Exception as e:
+            self.plugin_logger.warning(f"配置迁移后保存失败（不影响运行）: {e}")
+
+    def get_targets_legacy(self) -> List[str]:
+        """读取旧版 target_conversation_id 配置（仅用于迁移）"""
+        targets_raw = self.config.get("target_conversation_id", [])
+        if isinstance(targets_raw, str):
+            return [t.strip() for t in targets_raw.split(",") if t.strip()]
+        targets = []
+        if isinstance(targets_raw, list):
+            for item in targets_raw:
+                item_str = str(item).strip()
+                if "," in item_str:
+                    targets.extend([t.strip() for t in item_str.split(",") if t.strip()])
+                elif item_str:
+                    targets.append(item_str)
+        return targets
+
     def get_headers(self, uid: str = "") -> Dict[str, str]:
         """获取请求头"""
         cookie = self.config.get("weibo_cookie", "")
@@ -744,24 +795,68 @@ class WeiboMonitor(Star):
             self.plugin_logger.error(f"抓取单条微博出错: {e}，bid: {bid}")
             return None
 
+    def _iter_mappings(self):
+        """统一解析 subscription_mappings，自动规范化缺失的 :*。
+        对只写了会话 ID 而省略冒号的行，自动补全为 *。
+        对只写了冒号但右侧为空的行，自动补全为 *。
+        """
+        mappings = self.config.get("subscription_mappings", [])
+        if isinstance(mappings, str):
+            mappings = [m.strip() for m in mappings.split("\n") if m.strip()]
+        if not isinstance(mappings, list):
+            return
+        for mapping in mappings:
+            mapping = str(mapping).strip()
+            if not mapping:
+                continue
+            if ":" not in mapping:
+                # 用户只写了会话ID，自动补全为 *（接收全部）
+                yield (mapping, "*")
+                continue
+            parts = mapping.split(":", 1)
+            session_id = parts[0].strip()
+            uids_str = parts[1].strip() if len(parts) > 1 else ""
+            if not session_id:
+                continue
+            if not uids_str:
+                # 用户写了 "会话ID:" 但后面为空，自动补全为 *
+                uids_str = "*"
+            yield (session_id, uids_str)
+
     def get_targets(self) -> List[str]:
-        targets_raw = self.config.get("target_conversation_id", [])
-        if isinstance(targets_raw, str):
-            return [t.strip() for t in targets_raw.split(",") if t.strip()]
-        
-        # 兼容处理列表中包含逗号分隔字符串的情况
+        """返回所有 '*' 全局广播会话，用于热搜/总结等非 UID 相关推送。"""
         targets = []
-        if isinstance(targets_raw, list):
-            for item in targets_raw:
-                item_str = str(item).strip()
-                if "," in item_str:
-                    targets.extend([t.strip() for t in item_str.split(",") if t.strip()])
-                elif item_str:
-                    targets.append(item_str)
+        for session_id, uids_str in self._iter_mappings():
+            if uids_str == "*":
+                targets.append(session_id)
         return targets
+
+    def _get_all_subscribed_sessions(self) -> set:
+        """返回 subscription_mappings 中所有已配置的会话 ID。"""
+        sessions = set()
+        for session_id, _ in self._iter_mappings():
+            sessions.add(session_id)
+        return sessions
+
+    def _get_targets_for_uid(self, uid: str) -> List[str]:
+        """返回应接收指定 UID 微博推送的所有会话。
+        * 表示接收全部，匹配具体 UID 则只推送给该会话。
+        """
+        targets = set()
+        for session_id, uids_str in self._iter_mappings():
+            if uids_str == "*":
+                targets.add(session_id)
+                continue
+            for sub_item in uids_str.split(","):
+                sub_item = sub_item.strip()
+                if self._resolve_uid_from_config(sub_item) == uid:
+                    targets.add(session_id)
+                    break
+        return list(targets)
 
     @staticmethod
     def _resolve_uid_from_config(item: str) -> Optional[str]:
+        """从配置条目中提取数字 UID，支持纯数字或 URL 格式。"""
         item = item.strip()
         if item.isdigit():
             return item
@@ -770,59 +865,18 @@ class WeiboMonitor(Star):
             return match.group(2)
         return None
 
-    def _get_all_subscribed_sessions(self) -> set:
-        mappings = self.config.get("subscription_mappings", [])
-        if isinstance(mappings, str):
-            mappings = [m.strip() for m in mappings.split("\n") if m.strip()]
-        if not isinstance(mappings, list):
-            return set()
-
-        sessions = set()
-        for mapping in mappings:
-            mapping = str(mapping).strip()
-            if ":" not in mapping:
-                continue
-            parts = mapping.split(":", 1)
-            session_id = parts[0].strip()
-            if session_id:
-                sessions.add(session_id)
-        return sessions
-
-    def _get_targets_for_uid(self, uid: str) -> List[str]:
-        subscription_targets = set()
-        all_subscribed_sessions = self._get_all_subscribed_sessions()
-
-        mappings = self.config.get("subscription_mappings", [])
-        if isinstance(mappings, str):
-            mappings = [m.strip() for m in mappings.split("\n") if m.strip()]
-        if isinstance(mappings, list):
-            for mapping in mappings:
-                mapping = str(mapping).strip()
-                if ":" not in mapping:
-                    continue
-                parts = mapping.split(":", 1)
-                session_id = parts[0].strip()
-                uids_str = parts[1].strip()
-                if not session_id or not uids_str:
-                    continue
-                subscribed_uids = [u.strip() for u in uids_str.split(",") if u.strip()]
-                for sub_item in subscribed_uids:
-                    if self._resolve_uid_from_config(sub_item) == uid:
-                        subscription_targets.add(session_id)
-                        break
-
-        global_targets = self.get_targets()
-        for target in global_targets:
-            if target not in all_subscribed_sessions:
-                subscription_targets.add(target)
-
-        return list(subscription_targets)
-
     @filter.command("weibo_umo")
     async def weibo_umo(self, event: AstrMessageEvent):
-        """获取当前会话的 ID (unified_msg_origin)，用于设置推送目标"""
+        """获取当前会话 ID，并给出配置示例"""
+        sid = event.unified_msg_origin
         yield event.plain_result(
-            f"当前会话 ID: {event.unified_msg_origin}\n请将此 ID 填入插件设置中的 target_conversation_id 项。"
+            f"📌 当前会话 ID: {sid}\n\n"
+            f"请在 WebUI 插件设置 → subscription_mappings 中添加一行：\n\n"
+            f"  接收所有博主 + 热搜 + 总结:\n"
+            f"    {sid}: *\n\n"
+            f"  只接收指定博主:\n"
+            f"    {sid}: 博主UID1, 博主UID2\n\n"
+            f"博主 UID 从微博主页链接中获取，如 https://weibo.com/u/1234567890 → UID 是 1234567890"
         )
 
     @filter.command("weibo_export")
@@ -1001,6 +1055,7 @@ class WeiboMonitor(Star):
 
     @filter.command("weibo_check")
     async def weibo_check(self, event: AstrMessageEvent):
+        """立即抓取列表里第一个账号并推送最新一条微博"""
         urls = self._parse_urls(self.config.get("weibo_urls", []))
         if not urls:
             yield event.plain_result("❌ 未在插件设置中配置监控URL。")
@@ -1027,6 +1082,7 @@ class WeiboMonitor(Star):
 
     @filter.command("weibo_check_all")
     async def weibo_check_all(self, event: AstrMessageEvent):
+        """立即抓取列表里所有账号并推送最新微博（逐个检查，间隔请求）"""
         urls = self._parse_urls(self.config.get("weibo_urls", []))
         msg_format = self.message_format
         
@@ -1088,21 +1144,21 @@ class WeiboMonitor(Star):
 
     @filter.command("weibo_status")
     async def weibo_status(self, event: AstrMessageEvent):
+        """查看当前监控状态（账号数、推送目标、Cookie、检查间隔等）"""
         urls = self._parse_urls(self.config.get("weibo_urls", []))
-        targets = self.get_targets()
-        subscribed_sessions = self._get_all_subscribed_sessions()
-        
+        all_sessions = self._get_all_subscribed_sessions()
+        star_sessions = set(self.get_targets())
+        specific_sessions = all_sessions - star_sessions
+
         status_lines = ["📊 微博监控当前状态："]
         status_lines.append(f"- 监控账号数：{len(urls)} 个")
-        status_lines.append(f"- 推送目标数：{len(targets)} 个")
-        
-        if subscribed_sessions:
-            status_lines.append(f"- 订阅分组：✅ 已为 {len(subscribed_sessions)} 个会话配置独立订阅")
-            broadcast_count = len([t for t in targets if t not in subscribed_sessions])
-            if broadcast_count > 0:
-                status_lines.append(f"  （{broadcast_count} 个全局目标接收全部推送）")
+
+        if all_sessions:
+            status_lines.append(f"- 推送目标数：{len(all_sessions)} 个会话")
+            if star_sessions:
+                status_lines.append(f"  （{len(star_sessions)} 个全局会话（*），{len(specific_sessions)} 个订阅会话）")
         else:
-            status_lines.append(f"- 订阅分组：未配置（所有目标会话接收全部推送）")
+            status_lines.append(f"- 推送目标：未配置（所有推送将不发送）")
         
         check_interval = self.config.get("check_interval", DEFAULT_CHECK_INTERVAL)
         status_lines.append(f"- 检查间隔：{check_interval} 分钟")
@@ -1363,7 +1419,7 @@ class WeiboMonitor(Star):
                         self.plugin_logger.warning("WeiboMonitor: 未配置微博Cookie，跳过本轮检查。请尽快配置！")
                     elif not urls:
                         self.plugin_logger.debug("WeiboMonitor: 未配置监控URL")
-                    elif not targets and not self._get_all_subscribed_sessions():
+                    elif not self._get_all_subscribed_sessions():
                         self.plugin_logger.debug("WeiboMonitor: 未配置推送目标会话ID")
                     else:
                         # 检查 Cookie 健康
