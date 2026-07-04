@@ -31,13 +31,15 @@ DEFAULT_HOTSEARCH_TOP_N = 10
 DEFAULT_HOTSEARCH_TEMPLATE = "🔥 微博热搜榜 Top {top_n}\n⏰ 更新时间: {time}\n\n{items}"
 
 
-@register("astrbot_plugin_weibo_monitor", "Sayaka", "定时监控微博用户动态并推送到指定会话，支持按会话分组订阅不同博主。", "v1.17.0", "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor")
+@register("astrbot_plugin_weibo_monitor", "Sayaka", "定时监控微博用户动态并推送到指定会话，支持按会话分组订阅不同博主。", "v1.18.4", "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor")
 class WeiboMonitor(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
         self.config = config or {}
         self.monitor_task: Optional[asyncio.Task] = None
+        self.push_consumer_task: Optional[asyncio.Task] = None
         self.cookie_invalid_notified = False # cookie 失效是否已通知
+        self.push_queue: asyncio.Queue = asyncio.Queue()
 
         # 确保数据目录存在
         self.data_dir = StarTools.get_data_dir()
@@ -107,6 +109,7 @@ class WeiboMonitor(Star):
 
         # 启动后台监控任务
         self.monitor_task = asyncio.create_task(self.run_monitor())
+        self.push_consumer_task = asyncio.create_task(self._push_consumer())
 
     def setup_logging(self):
         """设置运行日志"""
@@ -625,6 +628,12 @@ class WeiboMonitor(Star):
                 await self.monitor_task
             except asyncio.CancelledError:
                 pass
+        if self.push_consumer_task:
+            self.push_consumer_task.cancel()
+            try:
+                await self.push_consumer_task
+            except asyncio.CancelledError:
+                pass
         await self.client.aclose()
         self.plugin_logger.info("WeiboMonitor 插件已停止")
 
@@ -642,6 +651,38 @@ class WeiboMonitor(Star):
                     url = "https:" + url
                 image_urls.append(url)
         return image_urls
+
+    def _extract_video_info(self, mblog: dict) -> Optional[dict]:
+        """从微博博文数据中提取视频信息。
+        若 page_info.type == "video" 则返回包含 url、cover 等的字典，
+        否则返回 None。同时检查转发微博的视频。
+        """
+        page_info = mblog.get("page_info")
+        if not (page_info and isinstance(page_info, dict) and page_info.get("type") == "video"):
+            retweet = mblog.get("retweeted_status")
+            if isinstance(retweet, dict):
+                page_info = retweet.get("page_info")
+        if not (page_info and isinstance(page_info, dict) and page_info.get("type") == "video"):
+            return None
+
+        urls = page_info.get("urls") or {}
+        video_url = None
+        for quality in ("mp4_720p_mp4", "mp4_hd_mp4", "mp4_ld_mp4"):
+            video_url = urls.get(quality)
+            if video_url:
+                break
+        if not video_url:
+            return None
+
+        if video_url.startswith("//"):
+            video_url = "https:" + video_url
+
+        return {
+            "url": video_url,
+            "cover": page_info.get("page_pic"),
+            "duration": (page_info.get("media_info") or {}).get("duration"),
+            "title": page_info.get("page_title"),
+        }
 
     async def _download_image(self, url: str, save_name: str) -> Optional[str]:
         """下载图片到临时目录，返回本地文件路径"""
@@ -666,16 +707,72 @@ class WeiboMonitor(Star):
             self.plugin_logger.error(f"下载图片出错: {e}，URL: {url}")
             return None
 
-    def _cleanup_temp_images(self):
-        """清理临时图片目录中超过 1 小时的文件"""
+    def _cleanup_temp_media(self):
+        """清理临时媒体目录中超过配置保留时长的文件。0 = 不清理。"""
+        retention = self.config.get("temp_media_retention_minutes", 10)
+        if retention <= 0:
+            return
         try:
             import time
             now = time.time()
+            max_age = retention * 60
             for f in self.temp_images_dir.iterdir():
-                if f.is_file() and now - f.stat().st_mtime > 3600:
+                if f.is_file() and now - f.stat().st_mtime > max_age:
                     f.unlink()
         except Exception as e:
-            self.plugin_logger.debug(f"清理临时图片出错: {e}")
+            self.plugin_logger.debug(f"清理临时媒体文件出错: {e}")
+
+    async def _download_video(self, url: str, save_name: str) -> Optional[str]:
+        """流式下载视频到临时目录，返回本地文件路径。
+        受 max_video_size_mb 限制（0 = 不限制）。
+        """
+        max_size_mb = self.config.get("max_video_size_mb", 0)
+        max_bytes = max_size_mb * 1024 * 1024 if max_size_mb > 0 else None
+        headers = {
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/604.1",
+            "Referer": "https://m.weibo.cn/",
+        }
+        cookie = self.config.get("weibo_cookie", "")
+        if cookie:
+            headers["Cookie"] = cookie
+
+        try:
+            async with self._request_semaphore:
+                async with self.client.stream("GET", url, headers=headers) as resp:
+                    if resp.status_code != 200:
+                        self.plugin_logger.warning(f"下载视频失败，状态码: {resp.status_code}，URL: {url}")
+                        return None
+
+                    content_length = resp.headers.get("content-length")
+                    if content_length and max_bytes:
+                        size_mb = int(content_length) / (1024 * 1024)
+                        if size_mb > max_size_mb:
+                            self.plugin_logger.warning(
+                                f"视频大小 {size_mb:.1f}MB 超过限制 {max_size_mb}MB，跳过: {url}"
+                            )
+                            return None
+
+                    save_path = self.temp_images_dir / save_name
+                    downloaded = 0
+                    with open(save_path, "wb") as f:
+                        async for chunk in resp.aiter_bytes(chunk_size=65536):
+                            f.write(chunk)
+                            if max_bytes:
+                                downloaded += len(chunk)
+                                if downloaded > max_bytes:
+                                    f.close()
+                                    try:
+                                        save_path.unlink(missing_ok=True)
+                                    except Exception:
+                                        pass
+                                    self.plugin_logger.warning(
+                                        f"视频下载超过限制 {max_size_mb}MB，已取消: {url}"
+                                    )
+                                    return None
+                    return str(save_path)
+        except Exception as e:
+            self.plugin_logger.error(f"下载视频出错: {e}，URL: {url}")
+            return None
 
     def _format_post_text(self, post: dict, msg_format: str) -> str:
         """格式化微博文本内容"""
@@ -708,6 +805,18 @@ class WeiboMonitor(Star):
                 local_paths.append(local_path)
         return local_paths
 
+    async def _download_post_video(self, post: dict) -> Optional[str]:
+        """下载微博视频并返回本地路径。无视频时返回 None。"""
+        video_info = post.get("video_info")
+        if not video_info:
+            return None
+        video_url = video_info.get("url")
+        if not video_url:
+            return None
+        uid_part = post.get("link", "unknown").split("/")[-1] if post.get("link") else "unknown"
+        save_name = f"{uid_part}_video.mp4"
+        return await self._download_video(video_url, save_name)
+
     async def _send_post_to_targets(self, post: dict, msg_format: str,
                                      targets: List[str], skip_log: bool = False) -> int:
         """发送单条微博到指定目标。
@@ -718,15 +827,20 @@ class WeiboMonitor(Star):
             self._log_to_daily_file(post)
 
         text_content = self._format_post_text(post, msg_format)
-        image_paths = await self._download_post_images(post)
+
+        # 图片下载和推送
+        image_paths: List[str] = []
+        if self.config.get("enable_image_download", True):
+            image_paths = await self._download_post_images(post)
 
         # 文字与图片分别独立发送，解决飞书适配器图文混合消息文字丢失问题。
         # 所有平台统一采用此方式。
         text_chain = MessageChain().message(text_content)
 
-        img_chain = MessageChain()
-        for img_path in image_paths:
-            img_chain.chain.append(Comp.Image(file=img_path))
+        if image_paths:
+            img_chain = MessageChain()
+            for img_path in image_paths:
+                img_chain.chain.append(Comp.Image(file=img_path))
 
         for target in targets:
             try:
@@ -735,6 +849,45 @@ class WeiboMonitor(Star):
                     await self.context.send_message(target, img_chain)
             except Exception as e:
                 self.plugin_logger.error(f"WeiboMonitor: 推送到 {target} 失败: {e}")
+
+        # 视频下载和推送
+        video_path = None
+        if self.config.get("enable_video_download", True) and post.get("video_info"):
+            self.plugin_logger.info(
+                f"检测到视频微博，开始下载: {post.get('link', 'unknown')}"
+            )
+            try:
+                dl_timeout = self.config.get("video_download_timeout", 60)
+                if dl_timeout > 0:
+                    video_path = await asyncio.wait_for(
+                        self._download_post_video(post), timeout=dl_timeout
+                    )
+                else:
+                    video_path = await self._download_post_video(post)
+            except asyncio.TimeoutError:
+                self.plugin_logger.warning(
+                    f"视频下载超时（{dl_timeout}秒），已跳过: {post.get('link', 'unknown')}"
+                )
+                video_path = None
+        post["_video_sent"] = video_path is not None
+
+        if video_path:
+            send_timeout = self.config.get("video_send_timeout", 60)
+            video_chain = MessageChain()
+            video_chain.chain.append(Comp.Video.fromFileSystem(path=video_path))
+            for target in targets:
+                try:
+                    if send_timeout > 0:
+                        await asyncio.wait_for(
+                            self.context.send_message(target, video_chain),
+                            timeout=send_timeout
+                        )
+                    else:
+                        await self.context.send_message(target, video_chain)
+                except asyncio.TimeoutError:
+                    self.plugin_logger.warning(f"视频推送到 {target} 超时（{send_timeout}秒）")
+                except Exception as e:
+                    self.plugin_logger.error(f"WeiboMonitor: 视频推送到 {target} 失败: {e}")
 
         return len(image_paths)
 
@@ -783,6 +936,7 @@ class WeiboMonitor(Star):
                 link = f"{WEIBO_WEB_BASE}/{uid}/{bid}" if uid else f"{WEIBO_WEB_BASE}/detail/{bid}"
                 created_at = self._parse_weibo_time(mblog.get("created_at", ""))
                 image_urls = self._extract_image_urls(mblog)
+                video_info = self._extract_video_info(mblog)
 
                 return {
                     "text": text,
@@ -790,6 +944,7 @@ class WeiboMonitor(Star):
                     "username": username,
                     "created_at": created_at,
                     "image_urls": image_urls,
+                    "video_info": video_info,
                 }
         except Exception as e:
             self.plugin_logger.error(f"抓取单条微博出错: {e}，bid: {bid}")
@@ -1074,8 +1229,7 @@ class WeiboMonitor(Star):
         latest_posts = await self.check_weibo(uid, force_fetch=True)
         if latest_posts:
             uid_targets = self._get_targets_for_uid(uid)
-            if uid_targets:
-                await self._send_new_posts(latest_posts, uid_targets, msg_format, event.unified_msg_origin, skip_log=True)
+            await self._send_new_posts(latest_posts, uid_targets, msg_format, event.unified_msg_origin, skip_log=True)
             yield event.plain_result(f"✅ {latest_posts[0].get('username')} 已发送最新动态。")
         else:
             yield event.plain_result(f"ℹ️ UID {uid} 未获取到有效微博。")
@@ -1111,8 +1265,7 @@ class WeiboMonitor(Star):
             latest_posts = await self.check_weibo(uid, force_fetch=True)
             if latest_posts:
                 uid_targets = self._get_targets_for_uid(uid)
-                if uid_targets:
-                    await self._send_new_posts(latest_posts, uid_targets, msg_format, event.unified_msg_origin, skip_log=True)
+                await self._send_new_posts(latest_posts, uid_targets, msg_format, event.unified_msg_origin, skip_log=True)
                 results.append(f"✅ {latest_posts[0].get('username')} 已发送最新动态。")
             else:
                 results.append(f"ℹ️ UID {uid} 未获取到有效微博。")
@@ -1317,8 +1470,11 @@ class WeiboMonitor(Star):
         actual_images = await self._send_post_to_targets(post, msg_format, targets, skip_log=True)
 
         image_info = f"，含 {actual_images} 张图片" if actual_images > 0 else ""
+        video_info_text = ""
+        if post.get("video_info"):
+            video_info_text = "，含视频" if post.get("_video_sent") else "，视频下载失败"
 
-        yield event.plain_result(f"✅ 已向 {len(targets)} 个目标推送 {post.get('username')} 的微博{image_info}。")
+        yield event.plain_result(f"✅ 已向 {len(targets)} 个目标推送 {post.get('username')} 的微博{image_info}{video_info_text}。")
 
     @property
     def message_format(self) -> str:
@@ -1362,9 +1518,12 @@ class WeiboMonitor(Star):
                     error_backoff = 60
                     self.plugin_logger.info("WeiboMonitor: 连续错误已清除，恢复正常监控频率")
                 
-                if asyncio.get_event_loop().time() - last_cleanup_time >= 3600:
-                    self._cleanup_temp_images()
-                    last_cleanup_time = asyncio.get_event_loop().time()
+                retention = self.config.get("temp_media_retention_minutes", 10)
+                if retention > 0:
+                    cleanup_interval = max(60, retention * 60)
+                    if asyncio.get_event_loop().time() - last_cleanup_time >= cleanup_interval:
+                        self._cleanup_temp_media()
+                        last_cleanup_time = asyncio.get_event_loop().time()
                 
                 # 1. 检查是否需要发送每日总结
                 summary_time = self.config.get("daily_summary_time", "08:00")
@@ -1523,11 +1682,32 @@ class WeiboMonitor(Star):
                 if new_posts:
                     uid_targets = self._get_targets_for_uid(uid)
                     if uid_targets:
-                        await self._send_new_posts(new_posts, uid_targets, msg_format)
+                        for post in new_posts:
+                            self._log_to_daily_file(post)
+                            await self.push_queue.put((post, uid_targets, msg_format))
+                        self.plugin_logger.info(
+                            f"WeiboMonitor: UID {uid} 发现 {len(new_posts)} 条新微博，已加入推送队列"
+                        )
                     else:
                         self.plugin_logger.debug(f"WeiboMonitor: UID {uid} 没有可推送的目标会话")
             except Exception as e:
                 self.plugin_logger.error(f"WeiboMonitor: 检查URL {url} 时出错: {e}")
+
+    async def _push_consumer(self):
+        """后台推送消费者：持续从队列取出待推送微博，逐条发送。
+        与监控周期解耦，避免大文件下载阻塞检查节奏。
+        """
+        while True:
+            try:
+                post, targets, msg_format = await self.push_queue.get()
+                self.plugin_logger.info(
+                    f"[推送队列] 开始推送 {post.get('username')} 的微博，队列剩余 {self.push_queue.qsize()}"
+                )
+                await self._send_post_to_targets(post, msg_format, targets, skip_log=True)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.plugin_logger.error(f"[推送队列] 推送出错: {e}")
 
     async def _send_new_posts(self, new_posts: List[dict], targets: List[str], msg_format: str, 
                                fallback_target: str = None, skip_log: bool = False):
@@ -1720,6 +1900,7 @@ class WeiboMonitor(Star):
                             "username": username,
                             "created_at": created_at,
                             "image_urls": self._extract_image_urls(mblog),
+                            "video_info": self._extract_video_info(mblog),
                         }
                         self._log_to_daily_file(post)
             else:
@@ -1775,13 +1956,15 @@ class WeiboMonitor(Star):
             created_at_raw = mblog.get("created_at")
             created_at = self._parse_weibo_time(created_at_raw)
             image_urls = self._extract_image_urls(mblog)
-            
+            video_info = self._extract_video_info(mblog)
+
             new_posts.append({
-                "text": text, 
-                "link": link, 
+                "text": text,
+                "link": link,
                 "username": username,
                 "created_at": created_at,
                 "image_urls": image_urls,
+                "video_info": video_info,
             })
 
             if force_fetch:

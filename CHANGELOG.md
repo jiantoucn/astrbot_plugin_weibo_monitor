@@ -1,5 +1,17 @@
 # 更新日志 (CHANGELOG)
 
+- **v1.18.4**:
+  - **新配置项**: `enable_image_download`（默认开启），控制是否下载并推送微博图片。关闭后只推送文字和视频，不下载图片。
+  - **优化**: 重新组织插件配置项顺序，图片/视频/临时文件相关配置集中排列，方便查找。
+- **v1.18.3**:
+  - **修复**: `/weibo_check` 和 `/weibo_check_all` 命令在 `subscription_mappings` 未配置当前会话时静默不推送的问题。移除了 `if uid_targets:` 守卫，改为依赖 `_send_new_posts` 内部的 `fallback_target` 兜底，确保当前会话总能收到推送。
+- **v1.18.2**:
+  - **优化**: 临时媒体文件（图片/视频）保留时长改为可配置，默认 10 分钟（原 1 小时）。新增 `temp_media_retention_minutes` 配置项，设为 0 则不清理。
+  - **重构**: 将 `_cleanup_temp_images` 重命名为 `_cleanup_temp_media`，清理间隔跟随配置值动态调整。
+- **v1.18.1**:
+  - **新配置项**: `video_download_timeout`（默认 60 秒）和 `video_send_timeout`（默认 60 秒），可配置的视频下载和上传超时。设置为 0 则不限制。
+  - **推送队列**: 后台监控发现的新微博不再直接发送，而是加入 `asyncio.Queue` 队列，由独立消费者逐条处理。监控周期与推送过程完全解耦，大视频下载不会阻塞检查节奏。
+- **v1.18.0**:
 - **v1.17.0**:
   - **新功能**: 统一推送目标配置。将 `target_conversation_id`（全局广播）和 `subscription_mappings`（订阅过滤）合并为单一的 `subscription_mappings` 配置项。使用 `*` 表示全局广播（该会话接收所有博主推送 + 热搜 + 每日总结），使用具体 UID 表示只接收指定博主。若只写会话 ID 而省略冒号（如 `群A`），自动补全为 `*`。
   - **迁移**: 首次启动时同步自动将旧版 `target_conversation_id` 中的全局目标迁移到 `subscription_mappings`（追加 `会话ID: *`），确保 run_monitor 启动前完成。

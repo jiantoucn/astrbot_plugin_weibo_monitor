@@ -73,7 +73,7 @@ async def handler(self, event: AstrMessageEvent, arg: str = ""):
 | `CHANGELOG.md` | 新增对应版本条目 |
 | `.docs/code-index.md` | 新增/删除方法时更新；版本号虽不显式写在此文件中，但代码行号变化后必须同步 |
 
-递增规则：修复/优化 → Patch（`x.y.Z`），新功能 → Minor（`x.Y.0`），仅用户明确要求 → Major（`X.0.0`）。
+递增规则：修复/优化 → Patch（`x.y.Z`），新功能 → Minor（`x.Y.0`），仅用户明确要求 → Major（`X.0.0`）。**每次实际改动（增删代码、改配置项、改逻辑）都必须递增版本号，不论改动多小。** 改呲了回滚的不算。
 
 ## 代码风格
 

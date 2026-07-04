@@ -22,6 +22,7 @@
 - **热搜监控**：定时推送微博热搜榜前 N 条（默认无需 Cookie，遇风控自动兜底），支持过滤广告位，间隔和数量可配置。
 - **统一推送配置**：通过 `subscription_mappings` 一个配置项管理所有推送目标。`*` = 全局广播（含热搜和总结），指定 UID = 只收该博主。支持多个 UID，省略写法自动补全为 `*`。
 - **图文推送**：自动获取微博原图（最高清画质），文字与图片分别独立发送以兼容所有平台（QQ、KOOK、飞书等）。支持配置每条微博最多获取的图片数量。
+- **视频推送**：自动检测微博中的视频（含转发微博），流式下载后推送到目标会话。支持 720p / HD / LD 清晰度自动选择，可配置大小限制。
 - **单条微博抓取**：通过 `/weibo_get` 命令，可抓取并推送任意微博链接的内容（含图片）。
 
 ## 部署步骤
@@ -42,36 +43,38 @@
 
 3. **配置插件**：
    在 AstrBot 管理面板 -> 插件设置 -> `weibo_monitor` 中进行配置：
-   - `weibo_cookie`: **必填项** 微博登录 Cookie，必须填写才能正常使用。
-   - `weibo_urls`: 填入微博用户主页链接、UID或用户名，支持多种格式：
-     - 直接输入UID：如 `2803301701`
-     - 个人主页URL：如 `https://weibo.com/u/2803301701` 或 `https://m.weibo.cn/u/2803301701`
-     - 用户名URL：如 `https://weibo.com/n/用户名`
-     多个账号用逗号分隔。
-   - `check_interval`: 检查间隔（分钟），建议不要设置得太短（如 5-10 分钟）。
-   - `check_interval_jitter`: 检查间隔随机浮动范围（分钟），避免固定间隔被反爬识别，默认 0。
-   - `request_interval`: 账号请求间隔（秒），默认 5 秒。监控多个账号时，每个账号抓取之间会等待该时长，避免请求过快。
-   - `request_interval_jitter`: 请求间隔随机浮动范围（秒），默认 0。
-   - `subscription_mappings`: **必填**。推送目标与订阅映射（统一配置），格式为 `会话ID: UID/链接` 或 `会话ID: *`。每行配置一个会话，多个 UID 用逗号分隔。使用 `*` 表示该会话接收所有监控博主的推送（含热搜和每日总结）。示例：`group_abc: *`（接收全部），`group_xyz: 1234567890, https://weibo.com/u/xxx`（只接收指定博主）。通过指令 `/weibo_umo` 获取当前会话 ID。
-   - `target_conversation_id`: **已废弃**。旧配置会在首次启动时自动迁移至 `subscription_mappings`，无需手动操作。
-   - `cookie_notification_target`: **可选**。填入 Cookie 失效时的通知目标会话 ID。如果不填写，则向所有已配置的推送目标发送通知；如果填写，则仅向该 ID 发送通知。
-   - `message_format`: 自定义推送消息格式，支持 `{name}`、`{weibo}`、`{link}` 变量。
-   - `max_images_per_post`: 每条微博最多获取的图片数量，默认 `0`（获取所有图片）。设置为正整数可限制图片数量，如设置为 `3` 则只获取前三张图片。图片以最高清画质下载。
-   - `filter_keywords`: 屏蔽词列表，包含这些关键词的微博将不会被推送，多个关键词用逗号分隔。
-   - `whitelist_keywords`: 关键词白名单，只有微博正文包含白名单关键词时才会推送。为空时不限制。
+   - `weibo_urls`: 填入微博用户主页链接、UID或用户名，支持多种格式。多个用逗号分隔。
+   - `subscription_mappings`: **必填**。推送目标与订阅映射，格式 `会话ID: UID` 或 `会话ID: *`（`*` = 全部）。用 `/weibo_umo` 获取会话ID。
+   - `weibo_cookie`: **必填项** 微博登录 Cookie。
+   - `cookie_notification_target`: **可选**。Cookie 失效通知目标会话。
+   - `check_interval`: 检查间隔（分钟），默认 10。
+   - `check_interval_jitter`: 检查间隔随机浮动（分钟），默认 2。
+   - `request_interval`: 账号请求间隔（秒），默认 5。
+   - `request_interval_jitter`: 请求间隔随机浮动（秒），默认 1。
+   - `message_format`: 推送消息格式，支持 `{name}`、`{weibo}`、`{link}`。
+   - `enable_image_download`: 是否下载并推送图片，默认 `true`。
+   - `max_images_per_post`: 每条微博最多图片数，默认 `0`（全部）。
+   - `enable_video_download`: 是否下载并推送视频，默认 `true`。
+   - `max_video_size_mb`: 最大视频大小（MB），默认 `0`（不限制）。
+   - `video_download_timeout`: 视频下载超时（秒），默认 `60`。
+   - `video_send_timeout`: 视频发送超时（秒），默认 `60`。
+   - `temp_media_retention_minutes`: 临时文件保留时长（分钟），默认 `10`。
+   - `filter_keywords`: 屏蔽词列表。
+   - `whitelist_keywords`: 关键词白名单。
    - `send_original`: 是否推送原创微博，默认 `true`。
-  - `send_forward`: 是否推送转发微博，默认 `true`。
-  - `enable_plugin_log`: 是否开启运行日志 (plugin.log)，默认 `false`。
-  - `plugin_log_max_size`: 运行日志文件最大大小 (MB)，默认 `1`。
-  - `enable_daily_log`: 是否开启每日推送记录，默认 `false`。开启后，初始化监控时会自动记录获取到的历史微博，热搜推送也会同步记录。
-  - `enable_daily_summary`: 是否开启每日发送总结，默认 `false`。总结中包含微博动态和热搜推送次数。
-  - `daily_summary_time`: 每日总结推送时间，默认 `08:00`。
-  - `enable_hotsearch`: 是否开启微博热搜监控，默认 `false`。**热搜监控默认无需 Cookie，遇风控拦截自动使用 Cookie 兜底**。
-  - `hotsearch_interval`: 热搜推送间隔（分钟），默认 `60`（1 小时）。
-  - `hotsearch_top_n`: 推送热搜前 N 条，默认 `10`。
-  - `hotsearch_filter_ads`: 是否过滤热搜广告位，默认 `true`（开启）。
-  - `hotsearch_show_link`: 是否显示每条热搜的微博搜索链接，默认 `true`（开启）。关闭后仅显示序号和标题。
-  - `hotsearch_message_format`: 热搜推送消息格式，支持 `{top_n}`、`{time}`、`{items}` 变量。
+   - `send_forward`: 是否推送转发微博，默认 `true`。
+   - `enable_plugin_log`: 运行日志开关，默认 `false`。
+   - `plugin_log_max_size`: 日志文件最大大小 (MB)，默认 `1`。
+   - `enable_daily_log`: 每日推送记录开关，默认 `false`。
+   - `enable_daily_summary`: 每日总结开关，默认 `false`。
+   - `daily_summary_time`: 总结推送时间，默认 `08:00`。
+   - `enable_hotsearch`: 热搜监控开关，默认 `false`。
+   - `hotsearch_interval`: 热搜推送间隔（分钟），默认 `60`。
+   - `hotsearch_top_n`: 热搜前 N 条，默认 `10`。
+   - `hotsearch_filter_ads`: 过滤热搜广告，默认 `true`。
+   - `hotsearch_show_link`: 显示热搜链接，默认 `true`。
+   - `hotsearch_message_format`: 热搜消息格式。
+   - `target_conversation_id`: **已废弃**。首次启动自动迁移至 `subscription_mappings`。
 
 ## 关键词过滤规则
 
