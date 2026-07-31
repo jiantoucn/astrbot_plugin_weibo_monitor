@@ -44,7 +44,7 @@ CONFIG_GROUPS = {
 CONFIG_KEY_GROUPS = {key: group for group, keys in CONFIG_GROUPS.items() for key in keys}
 
 
-@register("astrbot_plugin_weibo_monitor", "Sayaka", "定时监控微博用户动态并推送到指定会话，支持按会话分组订阅不同博主。", "v1.19.0", "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor")
+@register("astrbot_plugin_weibo_monitor", "Sayaka", "定时监控微博用户动态并推送到指定会话，支持按会话分组订阅不同博主。", "v1.19.1", "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor")
 class WeiboMonitor(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -232,6 +232,12 @@ class WeiboMonitor(Star):
             ["POST"],
             "保存微博订阅分组",
         )
+        self.context.register_web_api(
+            f"/{PLUGIN_NAME}/push-statistics",
+            self.get_push_statistics,
+            ["GET"],
+            "获取微博推送统计",
+        )
 
     @staticmethod
     def _is_complete_subscription_reference(item: str) -> bool:
@@ -351,6 +357,54 @@ class WeiboMonitor(Star):
             "monitor_urls": self._parse_urls(self._get_config("weibo_urls", [])),
         })
 
+    def _build_push_statistics(self, days: int = 7) -> List[Dict[str, Any]]:
+        """从每日推送记录中汇总近几天的时段分布和账号排行。"""
+        result = []
+        now = self._get_utc8_now()
+        for offset in range(days - 1, -1, -1):
+            date = now - timedelta(days=offset)
+            date_str = date.strftime("%Y-%m-%d")
+            log_file = self.logs_dir / f"{date.strftime('%Y%m%d')}.log"
+            hourly = [0] * 24
+            accounts: Dict[str, int] = {}
+            total = 0
+            if log_file.exists():
+                try:
+                    with open(log_file, "r", encoding="utf-8") as file:
+                        for line in file:
+                            try:
+                                entry = json.loads(line)
+                            except (TypeError, ValueError):
+                                continue
+                            if not isinstance(entry, dict) or entry.get("type") in {"hotsearch", "initial_snapshot"}:
+                                continue
+                            time_str = str(entry.get("time", ""))
+                            try:
+                                hour = datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S").hour
+                            except ValueError:
+                                continue
+                            username = str(entry.get("username", "未知用户")).strip() or "未知用户"
+                            hourly[hour] += 1
+                            accounts[username] = accounts.get(username, 0) + 1
+                            total += 1
+                except OSError as error:
+                    self.plugin_logger.warning(f"读取推送统计日志失败 ({log_file.name}): {error}")
+
+            result.append({
+                "date": date_str,
+                "total": total,
+                "hourly": hourly,
+                "accounts": [
+                    {"username": username, "count": count}
+                    for username, count in sorted(accounts.items(), key=lambda item: (-item[1], item[0]))
+                ],
+            })
+        return result
+
+    async def get_push_statistics(self):
+        """供 Plugin Page 查询近七日微博推送统计。"""
+        return json_response({"days": self._build_push_statistics()})
+
     async def save_subscription_mappings(self):
         """校验页面提交的结构化数据，并序列化为兼容的旧字符串列表。"""
         payload = await request.json(default={})
@@ -465,35 +519,22 @@ class WeiboMonitor(Star):
             self.plugin_logger.error(f"解析微博时间失败 ({time_str}): {e}")
             return now.strftime("%Y-%m-%d %H:%M:%S")
 
-    def _log_to_daily_file(self, post: dict, skip_log: bool = False):
-        """记录每日推送记录 (JSON 格式)"""
+    def _log_to_daily_file(self, post: dict, skip_log: bool = False,
+                           delivery_count: int = 0, record_type: str = "weibo"):
+        """记录实际推送或初始化快照，使用记录发生时的 UTC+8 时间。"""
         if skip_log or not self._get_config("enable_daily_log", False):
             return
-            
-        now = self._get_utc8_now()
-        publish_time_str = post.get("created_at")
-        
-        # 确定日志文件名和时间戳
-        if publish_time_str:
-            try:
-                # 解析 YYYY-MM-DD HH:mm:ss
-                publish_time = datetime.strptime(publish_time_str, "%Y-%m-%d %H:%M:%S")
-                date_str = publish_time.strftime("%Y%m%d")
-                log_time_str = publish_time_str
-            except:
-                date_str = now.strftime("%Y%m%d")
-                log_time_str = now.strftime("%Y-%m-%d %H:%M:%S")
-        else:
-            date_str = now.strftime("%Y%m%d")
-            log_time_str = now.strftime("%Y-%m-%d %H:%M:%S")
 
-        log_file = self.logs_dir / f"{date_str}.log"
-        
+        now = self._get_utc8_now()
+        log_file = self.logs_dir / f"{now.strftime('%Y%m%d')}.log"
         log_entry = {
-            "time": log_time_str,
+            "type": record_type,
+            "time": now.strftime("%Y-%m-%d %H:%M:%S"),
+            "published_time": post.get("created_at", ""),
             "username": post.get("username", "未知用户"),
             "content": post.get("text", ""),
-            "link": post.get("link", "")
+            "link": post.get("link", ""),
+            "delivery_count": delivery_count,
         }
         
         try:
@@ -1097,9 +1138,6 @@ class WeiboMonitor(Star):
         文字与图片分别独立发送，解决飞书适配器图文混合消息文字丢失问题（统一应用于所有平台）。
         返回实际发送的图片数量。
         """
-        if not skip_log:
-            self._log_to_daily_file(post)
-
         text_content = self._format_post_text(post, msg_format)
 
         # 图片下载和推送
@@ -1116,13 +1154,18 @@ class WeiboMonitor(Star):
             for img_path in image_paths:
                 img_chain.chain.append(Comp.Image(file=img_path))
 
+        successful_targets = 0
         for target in targets:
             try:
                 await self.context.send_message(target, text_chain)
+                successful_targets += 1
                 if image_paths:
                     await self.context.send_message(target, img_chain)
             except Exception as e:
                 self.plugin_logger.error(f"WeiboMonitor: 推送到 {target} 失败: {e}")
+
+        if successful_targets and not skip_log:
+            self._log_to_daily_file(post, delivery_count=successful_targets)
 
         # 视频下载和推送
         video_path = None
@@ -1979,7 +2022,6 @@ class WeiboMonitor(Star):
                     uid_targets = self._get_targets_for_uid(uid)
                     if uid_targets:
                         for post in new_posts:
-                            self._log_to_daily_file(post)
                             await self.push_queue.put((post, uid_targets, msg_format))
                         self.plugin_logger.info(
                             f"WeiboMonitor: UID {uid} 发现 {len(new_posts)} 条新微博，已加入推送队列"
@@ -1999,7 +2041,7 @@ class WeiboMonitor(Star):
                 self.plugin_logger.info(
                     f"[推送队列] 开始推送 {post.get('username')} 的微博，队列剩余 {self.push_queue.qsize()}"
                 )
-                await self._send_post_to_targets(post, msg_format, targets, skip_log=True)
+                await self._send_post_to_targets(post, msg_format, targets)
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -2198,7 +2240,7 @@ class WeiboMonitor(Star):
                             "image_urls": self._extract_image_urls(mblog),
                             "video_info": self._extract_video_info(mblog),
                         }
-                        self._log_to_daily_file(post)
+                        self._log_to_daily_file(post, record_type="initial_snapshot")
             else:
                 self.plugin_logger.info(f"WeiboMonitor: 已同步会话初始状态，UID {uid} ({username})，当前最新 ID: {latest_id}")
         return []

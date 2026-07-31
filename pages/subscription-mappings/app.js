@@ -7,6 +7,8 @@ const statusElement = document.querySelector("#status");
 let invalidRows = [];
 let monitoredAccounts = [];
 let monitorUrls = [];
+let statisticsDays = [];
+let selectedStatisticsDate = "";
 
 function setStatus(message, tone = "") {
   statusElement.textContent = message;
@@ -143,6 +145,49 @@ function renderInvalidRows(invalidRows) {
   });
 }
 
+function renderPushStatistics(days) {
+  statisticsDays = Array.isArray(days) ? days : [];
+  if (!statisticsDays.some((day) => day.date === selectedStatisticsDate)) {
+    selectedStatisticsDate = statisticsDays.length ? statisticsDays[statisticsDays.length - 1].date : "";
+  }
+  const selectedDay = statisticsDays.find((day) => day.date === selectedStatisticsDate) || { total: 0, hourly: [], accounts: [] };
+  document.querySelector("#stats-total").textContent = `${selectedDay.date || "今日"} ${selectedDay.total || 0} 条`;
+
+  const dayButtons = document.querySelector("#stats-days");
+  dayButtons.replaceChildren(...statisticsDays.map((day) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = `stats-day${day.date === selectedStatisticsDate ? " is-active" : ""}`;
+    button.textContent = `${day.date.slice(5)} · ${day.total} 条`;
+    button.addEventListener("click", () => { selectedStatisticsDate = day.date; renderPushStatistics(statisticsDays); });
+    return button;
+  }));
+
+  const maximum = Math.max(...(selectedDay.hourly || []), 1);
+  const chart = document.querySelector("#hourly-chart");
+  chart.replaceChildren(...Array.from({ length: 24 }, (_, hour) => {
+    const item = document.createElement("div");
+    item.className = "hour-bar";
+    item.title = `${String(hour).padStart(2, "0")}:00 · ${(selectedDay.hourly || [])[hour] || 0} 条`;
+    const value = document.createElement("span");
+    value.style.height = `${(((selectedDay.hourly || [])[hour] || 0) / maximum) * 100}%`;
+    const label = document.createElement("small");
+    label.textContent = hour % 3 === 0 ? String(hour).padStart(2, "0") : "";
+    item.append(value, label);
+    return item;
+  }));
+
+  const ranking = document.querySelector("#account-ranking");
+  const accounts = (selectedDay.accounts || []).slice(0, 5);
+  ranking.replaceChildren(...accounts.map((account, index) => {
+    const item = document.createElement("li");
+    item.innerHTML = `<span class="rank">${index + 1}</span><span class="account-name"></span><strong>${account.count} 条</strong>`;
+    item.querySelector(".account-name").textContent = account.username;
+    return item;
+  }));
+  document.querySelector("#ranking-empty").hidden = accounts.length > 0;
+}
+
 async function load() {
   try {
     await bridge.ready();
@@ -154,6 +199,12 @@ async function load() {
     invalidRows = data.invalid_rows || [];
     renderInvalidRows(invalidRows);
     updateEmptyState();
+    try {
+      const statistics = await bridge.apiGet("push-statistics");
+      renderPushStatistics(statistics.days);
+    } catch (error) {
+      renderPushStatistics([]);
+    }
   } catch (error) {
     setStatus(`加载失败：${error.message}`, "error");
   }

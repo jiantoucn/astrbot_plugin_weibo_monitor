@@ -30,6 +30,18 @@
         <p id="monitor-empty" class="empty-state">尚未添加监控博主；保存后插件不会抓取微博动态。</p>
       </section>
 
+      <section class="stats-card">
+        <div class="stats-heading">
+          <div><h2>📊 推送统计</h2><p>统计正文成功送达至少一个会话的微博，不包含热搜和初始化快照。</p></div>
+          <strong id="stats-total">今日 0 条</strong>
+        </div>
+        <div id="stats-days" class="stats-days" aria-label="统计日期"></div>
+        <div class="stats-content">
+          <div class="stats-panel"><h3>🕒 时段分布</h3><div id="hourly-chart" class="hourly-chart"></div></div>
+          <div class="stats-panel"><h3>🏆 博主排行</h3><ol id="account-ranking" class="account-ranking"></ol><p id="ranking-empty" class="stats-empty">该日尚无微博推送记录。</p></div>
+        </div>
+      </section>
+
       <section id="invalid-section" class="invalid-section" hidden>
         <h2>需要修复的旧配置</h2>
         <p>这些记录没有被自动删除。请在原插件配置中修复，或在此页面重新添加正确的会话后确认移除它们。</p>
