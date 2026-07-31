@@ -4,6 +4,7 @@ import httpx
 import os
 import json
 import base64
+import inspect
 import random
 import logging
 from logging.handlers import RotatingFileHandler
@@ -44,7 +45,7 @@ CONFIG_GROUPS = {
 CONFIG_KEY_GROUPS = {key: group for group, keys in CONFIG_GROUPS.items() for key in keys}
 
 
-@register("astrbot_plugin_weibo_monitor", "Sayaka", "定时监控微博用户动态并推送到指定会话，支持按会话分组订阅不同博主。", "v1.19.1", "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor")
+@register("astrbot_plugin_weibo_monitor", "Sayaka", "定时监控微博用户动态并推送到指定会话，支持按会话分组订阅不同博主。", "v1.19.2", "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor")
 class WeiboMonitor(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -105,6 +106,11 @@ class WeiboMonitor(Star):
                 self.plugin_logger.error(f"WeiboMonitor: 迁移数据失败: {e}")
 
         self._data = self._load_data()
+
+        # 订阅分组由 Plugin Page 管理。AstrBot 升级时若框架配置被默认值覆盖，
+        # 从持久化快照恢复，避免用户重新配置全部会话和博主。
+        self._restore_subscription_backup()
+        self._ensure_subscription_backup()
 
         # 迁移旧版配置：将 target_conversation_id 合并到 subscription_mappings（同步，确保在 run_monitor 前完成）
         self._migrate_config_v2()
@@ -198,25 +204,49 @@ class WeiboMonitor(Star):
         if changed:
             self._save_plugin_config("分组配置迁移")
 
-    def _save_plugin_config(self, reason: str = "配置"):
-        """保存同一份 AstrBot 配置对象；失败时只记录日志，不中断插件运行。"""
+    async def _save_plugin_config_async(self, reason: str = "配置") -> bool:
+        """等待 AstrBot 配置真正持久化完成，供页面保存接口确认结果。"""
         try:
             save_async = getattr(self.config, "save_config_async", None)
             if callable(save_async):
                 result = save_async()
-                if asyncio.iscoroutine(result):
-                    try:
-                        asyncio.get_running_loop().create_task(result)
-                    except RuntimeError:
-                        result.close()
-                        save_sync = getattr(self.config, "save_config", None)
-                        if callable(save_sync):
-                            save_sync()
-                return
+                if inspect.isawaitable(result):
+                    await result
+                return True
+
+            save_sync = getattr(self.config, "save_config", None)
+            if callable(save_sync):
+                result = save_sync()
+                if inspect.isawaitable(result):
+                    await result
+                return True
+
             if hasattr(self.context, "config_manager") and hasattr(self.context.config_manager, "save_config"):
-                self.context.config_manager.save_config()
+                result = self.context.config_manager.save_config()
+                if inspect.isawaitable(result):
+                    await result
+                return True
         except Exception as e:
-            self.plugin_logger.warning(f"{reason}保存失败（不影响运行）: {e}")
+            self.plugin_logger.warning(f"{reason}保存失败: {e}")
+            return False
+
+        self.plugin_logger.warning(f"{reason}保存失败：AstrBot 未提供可用的配置持久化接口")
+        return False
+
+    def _save_plugin_config(self, reason: str = "配置"):
+        """后台保存配置，供初始化迁移等不需要阻塞的场景使用。"""
+        try:
+            asyncio.get_running_loop().create_task(self._save_plugin_config_async(reason))
+        except RuntimeError:
+            # 插件初始化理论上运行在事件循环中；若框架在循环外调用，至少保留同步兜底。
+            save_sync = getattr(self.config, "save_config", None)
+            try:
+                if callable(save_sync):
+                    save_sync()
+                elif hasattr(self.context, "config_manager") and hasattr(self.context.config_manager, "save_config"):
+                    self.context.config_manager.save_config()
+            except Exception as e:
+                self.plugin_logger.warning(f"{reason}保存失败（不影响运行）: {e}")
 
     def _register_web_apis(self):
         """注册订阅分组页面使用的后端接口。"""
@@ -340,6 +370,75 @@ class WeiboMonitor(Star):
                 seen.add(value)
                 normalized.append(value)
         return normalized
+
+    def _save_subscription_backup(
+        self,
+        mappings: List[str],
+        delivery_options: Dict[str, Dict[str, bool]],
+        monitor_urls: List[str],
+    ) -> bool:
+        """将订阅页面配置写入独立快照，防止插件更新重置框架配置。"""
+        self._data["_subscription_page_backup"] = {
+            "subscription_mappings": list(mappings),
+            "subscription_delivery_options": delivery_options,
+            "weibo_urls": list(monitor_urls),
+            "saved_at": self._get_utc8_now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        return self._save_data()
+
+    def _restore_subscription_backup(self):
+        """仅在框架配置为空时恢复订阅快照，不覆盖用户已保存的新配置。"""
+        backup = self._data.get("_subscription_page_backup")
+        if not isinstance(backup, dict):
+            return
+
+        backup_mappings = backup.get("subscription_mappings")
+        backup_options = backup.get("subscription_delivery_options")
+        backup_urls = backup.get("weibo_urls")
+        if not isinstance(backup_mappings, list) or not isinstance(backup_options, dict) or not isinstance(backup_urls, list):
+            self.plugin_logger.warning("订阅分组备份格式无效，已跳过恢复")
+            return
+
+        restored = []
+        current_mappings = self.config.get("subscription_mappings", [])
+        if not current_mappings and backup_mappings:
+            self.config["subscription_mappings"] = list(backup_mappings)
+            restored.append("订阅分组")
+
+        current_options = self.config.get("subscription_delivery_options", {})
+        if not current_options and backup_options:
+            self.config["subscription_delivery_options"] = backup_options
+            restored.append("附加推送选项")
+
+        current_urls = self._parse_urls(self._get_config("weibo_urls", []))
+        if not current_urls and backup_urls:
+            self._set_config("weibo_urls", list(backup_urls))
+            restored.append("监控博主")
+
+        if restored:
+            self.plugin_logger.warning(f"检测到框架配置为空，已从订阅分组备份恢复：{'、'.join(restored)}")
+            self._save_plugin_config("订阅分组自动恢复")
+
+    def _ensure_subscription_backup(self):
+        """首次升级到带备份版本时，为已有页面配置补建恢复快照。"""
+        existing_backup = self._data.get("_subscription_page_backup")
+        if isinstance(existing_backup, dict):
+            return
+
+        mappings = self.config.get("subscription_mappings", [])
+        if isinstance(mappings, str):
+            mappings = [item.strip() for item in mappings.splitlines() if item.strip()]
+        if not isinstance(mappings, list):
+            mappings = []
+        options = self.config.get("subscription_delivery_options", {})
+        if not isinstance(options, dict):
+            options = {}
+        monitor_urls = self._parse_urls(self._get_config("weibo_urls", []))
+        if mappings or options or monitor_urls:
+            if self._save_subscription_backup(mappings, options, monitor_urls):
+                self.plugin_logger.info("已为现有订阅分组创建升级保护备份")
+            else:
+                self.plugin_logger.warning("现有订阅分组备份创建失败，请检查插件数据目录权限")
 
     async def get_subscription_mappings(self):
         """供 Plugin Page 读取结构化订阅分组。"""
@@ -465,7 +564,10 @@ class WeiboMonitor(Star):
         self.config["subscription_mappings"] = serialized
         self.config["subscription_delivery_options"] = delivery_options
         self._set_config("weibo_urls", normalized_monitor_urls)
-        self._save_plugin_config("订阅分组")
+        if not self._save_subscription_backup(serialized, delivery_options, normalized_monitor_urls):
+            return error_response("订阅分组备份保存失败，请检查插件数据目录权限后重试", status_code=500)
+        if not await self._save_plugin_config_async("订阅分组"):
+            return error_response("订阅分组未能写入 AstrBot 配置，请重试并查看插件日志", status_code=500)
         return json_response({"saved": True, "rows": serialized, "monitor_urls": normalized_monitor_urls})
 
     def _get_utc8_now(self) -> datetime:
@@ -852,6 +954,7 @@ class WeiboMonitor(Star):
             )
             # 原子替换
             temp_file.replace(self.data_file)
+            return True
         except Exception as e:
             self.plugin_logger.error(f"WeiboMonitor: 保存数据文件失败: {e}")
             # 清理临时文件
@@ -860,6 +963,7 @@ class WeiboMonitor(Star):
                     temp_file.unlink()
             except:
                 pass
+            return False
 
     async def get_kv_data(self, key: str, default=None):
         """获取持久化键值对"""

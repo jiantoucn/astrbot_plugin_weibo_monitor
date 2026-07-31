@@ -17,3 +17,4 @@
 .uid-checklist input { width:auto; }
 .uid-checklist.is-disabled { color:var(--muted); background:var(--bg); }
 .uid-checklist.is-disabled label { cursor:not-allowed; }
+.stats-card { margin-top:16px; }
