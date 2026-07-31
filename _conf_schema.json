@@ -1,195 +1,121 @@
 {
-  "weibo_urls": {
-    "type": "list",
-    "item_type": "string",
-    "default": [],
-    "description": "微博用户主页链接",
-    "hint": "可以填写多个，例如: https://weibo.com/u/1234567890"
-  },
   "subscription_mappings": {
     "type": "list",
     "item_type": "string",
     "default": [],
-    "description": "推送目标与订阅映射（统一配置）",
-    "hint": "一行一个会话。* = 全部，具体UID = 只收指定。多个UID用英文逗号分隔。示例: group_A: *（全部），group_B: 1234567890（指定），group_C: 1234567890, 9876543210（多个）。用 /weibo_umo 获取会话ID。"
+    "description": "订阅分组管理（请使用独立页面）",
+    "hint": "请在插件详情页打开“订阅分组管理”页面进行新增、编辑和保存。此字段仅保留为兼容存储，请不要在这里手动修改。"
   },
-  "weibo_cookie": {
-    "type": "string",
-    "default": "",
-    "description": "微博 Cookie",
-    "hint": "必须配置微博 Cookie 才能正常抓取数据，确保稳定性"
+  "subscription_delivery_options": {"type": "object", "items": {}, "default": {}, "invisible": true},
+  "account_settings": {
+    "type": "object",
+    "description": "微博账号与认证",
+    "hint": "配置需要监控的微博账号和访问凭据。",
+    "items": {
+      "weibo_urls": {"type": "list", "item_type": "string", "default": [], "invisible": true},
+      "weibo_cookie": {"type": "string", "default": "", "description": "微博 Cookie", "hint": "必须配置微博 Cookie 才能稳定抓取数据。"},
+      "cookie_notification_target": {"type": "string", "default": "", "description": "Cookie 失效通知目标", "hint": "可选。不填写时向所有已配置订阅分组的会话发送通知。"}
+    }
   },
-  "cookie_notification_target": {
-    "type": "string",
-    "default": "",
-    "description": "Cookie 失效通知目标",
-    "hint": "可选。如果不填写，则向 subscription_mappings 中所有已配置的会话发送通知；如果填写，则仅向该 ID 发送通知。"
+  "schedule_settings": {
+    "type": "object",
+    "description": "监控频率",
+    "hint": "设置微博检查和账号请求的时间间隔。",
+    "items": {
+      "check_interval": {"type": "int", "default": 10, "description": "检查间隔（分钟）"},
+      "check_interval_jitter": {"type": "int", "default": 2, "description": "检查间隔随机浮动（分钟）", "hint": "实际值会在间隔上下随机浮动。"},
+      "request_interval": {"type": "int", "default": 5, "description": "账号请求间隔（秒）"},
+      "request_interval_jitter": {"type": "int", "default": 1, "description": "请求间隔随机浮动（秒）"}
+    }
   },
-  "check_interval": {
-    "type": "int",
-    "default": 10,
-    "description": "检查间隔（分钟）"
+  "content_settings": {
+    "type": "object",
+    "description": "微博推送内容",
+    "hint": "设置需要推送的微博类型和消息格式。",
+    "items": {
+      "message_format": {"type": "string", "default": "🔔 {name} 发微博啦！\n\n{weibo}\n\n链接: {link}", "description": "推送消息格式", "hint": "支持 {name}、{weibo}、{link}。"},
+      "send_original": {"type": "bool", "default": true, "description": "推送原创微博"},
+      "send_forward": {"type": "bool", "default": true, "description": "推送转发微博"}
+    }
   },
-  "check_interval_jitter": {
-    "type": "int",
-    "default": 2,
-    "description": "检查间隔随机浮动（分钟）",
-    "hint": "实际检查间隔会在 [间隔-浮动, 间隔+浮动] 范围内随机选择。例如：间隔10，浮动2，则随机在 8-12 分钟内检查一次。"
+  "media_settings": {
+    "type": "object",
+    "description": "图片与视频",
+    "hint": "配置微博媒体文件的下载、发送和清理规则。",
+    "items": {
+      "enable_image_download": {"type": "bool", "default": true, "description": "下载并推送图片"},
+      "max_images_per_post": {"type": "int", "default": 0, "description": "每条微博最多获取图片数", "hint": "0 表示获取所有图片。"},
+      "enable_video_download": {"type": "bool", "default": true, "description": "下载并推送视频"},
+      "max_video_size_mb": {"type": "int", "default": 0, "description": "最大视频文件大小（MB）", "hint": "0 表示不限制。"},
+      "video_download_timeout": {"type": "int", "default": 60, "description": "视频下载超时（秒）", "hint": "0 表示不限制。"},
+      "video_send_timeout": {"type": "int", "default": 60, "description": "视频发送超时（秒）", "hint": "0 表示不限制。"},
+      "temp_media_retention_minutes": {"type": "int", "default": 10, "description": "临时媒体保留时长（分钟）", "hint": "0 表示不清理。"}
+    }
   },
-  "request_interval": {
-    "type": "int",
-    "default": 5,
-    "description": "账号请求间隔（秒）",
-    "hint": "多个账号间抓取的间隔时间，避免请求过快被拦截"
+  "filter_settings": {
+    "type": "object",
+    "description": "内容过滤",
+    "hint": "按照微博正文关键词决定是否推送。",
+    "items": {
+      "filter_keywords": {"type": "list", "item_type": "string", "default": [], "description": "屏蔽词列表"},
+      "whitelist_keywords": {"type": "list", "item_type": "string", "default": [], "description": "关键词白名单"}
+    }
   },
-  "request_interval_jitter": {
-    "type": "int",
-    "default": 1,
-    "description": "请求间隔随机浮动（秒）",
-    "hint": "实际请求间隔会在 [间隔-浮动, 间隔+浮动] 范围内随机选择。设置为0则不使用随机性。"
+  "logging_settings": {
+    "type": "object",
+    "description": "日志与每日总结",
+    "hint": "配置运行日志、推送记录和每日统计。",
+    "items": {
+      "enable_plugin_log": {"type": "bool", "default": true, "description": "开启运行日志"},
+      "plugin_log_max_size": {"type": "int", "default": 1, "description": "日志文件最大大小（MB）"},
+      "enable_daily_log": {"type": "bool", "default": true, "description": "开启每日推送记录"},
+      "enable_daily_summary": {"type": "bool", "default": true, "description": "开启每日发送总结"},
+      "daily_summary_time": {"type": "string", "default": "08:00", "description": "每日总结推送时间"}
+    }
   },
-  "message_format": {
-    "type": "string",
-    "default": "🔔 {name} 发微博啦！\n\n{weibo}\n\n链接: {link}",
-    "description": "推送消息格式",
-    "hint": "支持变量: {name} (用户名), {weibo} (内容), {link} (链接)"
+  "hotsearch_settings": {
+    "type": "object",
+    "description": "微博热搜",
+    "hint": "设置微博热搜榜的获取和推送方式。",
+    "items": {
+      "enable_hotsearch": {"type": "bool", "default": true, "description": "开启微博热搜监控"},
+      "hotsearch_interval": {"type": "int", "default": 60, "description": "热搜推送间隔（分钟）"},
+      "hotsearch_top_n": {"type": "int", "default": 10, "description": "推送热搜前 N 条"},
+      "hotsearch_filter_ads": {"type": "bool", "default": true, "description": "过滤热搜广告位"},
+      "hotsearch_show_link": {"type": "bool", "default": true, "description": "显示热搜条目链接"},
+      "hotsearch_message_format": {"type": "string", "default": "🔥 微博热搜榜 Top {top_n}\n⏰ 更新时间: {time}\n\n{items}", "description": "热搜推送消息格式", "hint": "支持 {top_n}、{time}、{items}。"}
+    }
   },
-  "enable_image_download": {
-    "type": "bool",
-    "default": true,
-    "description": "是否下载并推送图片",
-    "hint": "关闭后微博中的图片不会被下载和推送。"
-  },
-  "max_images_per_post": {
-    "type": "int",
-    "default": 0,
-    "description": "每条微博最多获取图片数",
-    "hint": "0 表示获取所有图片。设置为正整数则限制每条微博最多推送该数量的图片。"
-  },
-  "enable_video_download": {
-    "type": "bool",
-    "default": true,
-    "description": "是否下载并推送视频",
-    "hint": "开启后自动下载微博视频并推送到目标会话"
-  },
-  "max_video_size_mb": {
-    "type": "int",
-    "default": 0,
-    "description": "最大视频文件大小（MB）",
-    "hint": "超过此大小的视频将被跳过。0 表示不限制。"
-  },
-  "video_download_timeout": {
-    "type": "int",
-    "default": 60,
-    "description": "视频下载超时（秒）",
-    "hint": "超过此时长未下载完则中断。0 表示不限制。"
-  },
-  "video_send_timeout": {
-    "type": "int",
-    "default": 60,
-    "description": "视频发送（上传）超时（秒）",
-    "hint": "超过此时长未发送完则中断。0 表示不限制。"
-  },
-  "temp_media_retention_minutes": {
-    "type": "int",
-    "default": 10,
-    "description": "临时图片/视频保留时长（分钟）",
-    "hint": "超过此时长的临时媒体文件将被自动清理。0 表示不清理。"
-  },
-  "filter_keywords": {
-    "type": "list",
-    "item_type": "string",
-    "default": [],
-    "description": "屏蔽词列表",
-    "hint": "如果微博正文包含这些词，将不会被推送。例如: 推广, 广告"
-  },
-  "whitelist_keywords": {
-    "type": "list",
-    "item_type": "string",
-    "default": [],
-    "description": "关键词白名单",
-    "hint": "只有微博正文包含这些关键词时才会推送。为空时不限制。"
-  },
-  "send_original": {
-    "type": "bool",
-    "default": true,
-    "description": "是否推送原创微博"
-  },
-  "send_forward": {
-    "type": "bool",
-    "default": true,
-    "description": "是否推送转发微博"
-  },
-  "enable_plugin_log": {
-    "type": "bool",
-    "default": false,
-    "description": "开启运行日志 (plugin.log)",
-    "hint": "记录插件运行详细情况，方便排查问题"
-  },
-  "plugin_log_max_size": {
-    "type": "int",
-    "default": 1,
-    "description": "运行日志文件最大大小 (MB)"
-  },
-  "enable_daily_log": {
-    "type": "bool",
-    "default": false,
-    "description": "开启每日推送记录",
-    "hint": "记录每天推送的微博动态与热搜，以便进行统计或分析"
-  },
-  "enable_daily_summary": {
-    "type": "bool",
-    "default": false,
-    "description": "开启每日发送总结",
-    "hint": "每天定时推送前一天的监控统计信息（含微博动态与热搜推送次数）"
-  },
-  "daily_summary_time": {
-    "type": "string",
-    "default": "08:00",
-    "description": "每日总结推送时间",
-    "hint": "24小时制，例如: 08:00"
-  },
-  "enable_hotsearch": {
-    "type": "bool",
-    "default": false,
-    "description": "开启微博热搜监控",
-    "hint": "开启后定时推送微博热搜榜，无需 Cookie 即可使用"
-  },
-  "hotsearch_interval": {
-    "type": "int",
-    "default": 60,
-    "description": "热搜推送间隔（分钟）",
-    "hint": "默认 60 分钟（1 小时），值越小推送越频繁"
-  },
-  "hotsearch_top_n": {
-    "type": "int",
-    "default": 10,
-    "description": "推送热搜前 N 条",
-    "hint": "默认 10 条，可设置为 5、15、20 等"
-  },
-  "hotsearch_filter_ads": {
-    "type": "bool",
-    "default": true,
-    "description": "过滤热搜广告位",
-    "hint": "开启后自动过滤热搜榜中的广告/推广条目"
-  },
-  "hotsearch_show_link": {
-    "type": "bool",
-    "default": true,
-    "description": "显示热搜条目链接",
-    "hint": "开启后每条热搜下方会附带微博搜索链接，关闭则仅显示标题和序号"
-  },
-  "hotsearch_message_format": {
-    "type": "string",
-    "default": "🔥 微博热搜榜 Top {top_n}\n⏰ 更新时间: {time}\n\n{items}",
-    "description": "热搜推送消息格式",
-    "hint": "支持变量: {top_n} (热搜数量), {time} (更新时间), {items} (热搜条目列表)"
-  },
-  "target_conversation_id": {
-    "type": "list",
-    "item_type": "string",
-    "default": [],
-    "description": "推送目标会话 ID（已废弃，首次启动自动迁移至 subscription_mappings）",
-    "hint": "此字段已废弃。请使用 subscription_mappings 统一管理推送目标。旧配置将在首次启动时自动迁移。"
-  }
+  "_config_schema_version": {"type": "int", "default": 0, "invisible": true},
+  "weibo_urls": {"type": "list", "item_type": "string", "default": [], "invisible": true},
+  "weibo_cookie": {"type": "string", "default": "", "invisible": true},
+  "cookie_notification_target": {"type": "string", "default": "", "invisible": true},
+  "check_interval": {"type": "int", "default": 10, "invisible": true},
+  "check_interval_jitter": {"type": "int", "default": 2, "invisible": true},
+  "request_interval": {"type": "int", "default": 5, "invisible": true},
+  "request_interval_jitter": {"type": "int", "default": 1, "invisible": true},
+  "message_format": {"type": "string", "default": "🔔 {name} 发微博啦！\n\n{weibo}\n\n链接: {link}", "invisible": true},
+  "enable_image_download": {"type": "bool", "default": true, "invisible": true},
+  "max_images_per_post": {"type": "int", "default": 0, "invisible": true},
+  "enable_video_download": {"type": "bool", "default": true, "invisible": true},
+  "max_video_size_mb": {"type": "int", "default": 0, "invisible": true},
+  "video_download_timeout": {"type": "int", "default": 60, "invisible": true},
+  "video_send_timeout": {"type": "int", "default": 60, "invisible": true},
+  "temp_media_retention_minutes": {"type": "int", "default": 10, "invisible": true},
+  "filter_keywords": {"type": "list", "item_type": "string", "default": [], "invisible": true},
+  "whitelist_keywords": {"type": "list", "item_type": "string", "default": [], "invisible": true},
+  "send_original": {"type": "bool", "default": true, "invisible": true},
+  "send_forward": {"type": "bool", "default": true, "invisible": true},
+  "enable_plugin_log": {"type": "bool", "default": true, "invisible": true},
+  "plugin_log_max_size": {"type": "int", "default": 1, "invisible": true},
+  "enable_daily_log": {"type": "bool", "default": true, "invisible": true},
+  "enable_daily_summary": {"type": "bool", "default": true, "invisible": true},
+  "daily_summary_time": {"type": "string", "default": "08:00", "invisible": true},
+  "enable_hotsearch": {"type": "bool", "default": true, "invisible": true},
+  "hotsearch_interval": {"type": "int", "default": 60, "invisible": true},
+  "hotsearch_top_n": {"type": "int", "default": 10, "invisible": true},
+  "hotsearch_filter_ads": {"type": "bool", "default": true, "invisible": true},
+  "hotsearch_show_link": {"type": "bool", "default": true, "invisible": true},
+  "hotsearch_message_format": {"type": "string", "default": "🔥 微博热搜榜 Top {top_n}\n⏰ 更新时间: {time}\n\n{items}", "invisible": true},
+  "target_conversation_id": {"type": "list", "item_type": "string", "default": [], "invisible": true}
 }

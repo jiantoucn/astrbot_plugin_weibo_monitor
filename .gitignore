@@ -158,3 +158,18 @@ cython_debug/
 data/
 /.claude
 RECOMMEND.md
+
+# Local development / AI assistant context (not part of the plugin release)
+.docs/
+CLAUDE.md
+AGENTS.md
+.agents/
+.codex/
+
+# Local editor and operating-system files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*.tmp
+*.bak

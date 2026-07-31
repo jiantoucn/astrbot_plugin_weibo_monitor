@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>订阅分组管理</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <main class="page-shell">
+      <header>
+        <div>
+          <p class="eyebrow">微博监控助手</p>
+          <h1>订阅分组管理</h1>
+          <p class="subtitle">统一管理监控博主、会话订阅范围，以及热搜和每日总结。</p>
+        </div>
+      </header>
+
+      <section class="hint-card">
+        <strong>使用顺序：</strong>
+        先在下方添加要监控的微博 UID 或主页链接；再将这些博主分配给会话。会话 ID 可通过在目标群聊或私聊发送 <code>/weibo_umo</code> 获取。
+      </section>
+
+      <section class="monitor-card">
+        <div class="section-heading">
+          <div><h2>监控博主</h2><p>支持纯数字 UID、`weibo.com/u/UID` 或 `weibo.com/n/用户名` 主页链接。</p></div>
+          <div class="add-monitor"><input id="monitor-input" aria-label="微博 UID 或主页链接" placeholder="输入微博 UID 或主页链接" /><button id="add-monitor" class="button secondary" type="button">添加博主</button></div>
+        </div>
+        <div id="monitor-list" class="monitor-list"></div>
+        <p id="monitor-empty" class="empty-state">尚未添加监控博主；保存后插件不会抓取微博动态。</p>
+      </section>
+
+      <section id="invalid-section" class="invalid-section" hidden>
+        <h2>需要修复的旧配置</h2>
+        <p>这些记录没有被自动删除。请在原插件配置中修复，或在此页面重新添加正确的会话后确认移除它们。</p>
+        <div id="invalid-list"></div>
+      </section>
+
+      <section class="table-card">
+        <div class="mapping-toolbar">
+          <h2>会话订阅分组</h2>
+          <button id="add-row" class="button secondary" type="button">+ 添加会话</button>
+        </div>
+        <div class="table-header">
+          <span>会话 ID</span><span>微博接收范围</span><span>订阅博主</span><span>附加推送</span><span>操作</span>
+        </div>
+        <div id="rows" class="rows"></div>
+        <p id="empty-state" class="empty-state">暂无订阅分组。添加会话后，监控消息才会被推送。</p>
+      </section>
+
+      <footer>
+        <p id="status" role="status" aria-live="polite"></p>
+        <button id="save" class="button primary" type="button">保存订阅分组</button>
+      </footer>
+    </main>
+    <template id="row-template">
+      <article class="mapping-row">
+        <input class="session-id" aria-label="会话 ID" placeholder="例如：aiocqhttp:GroupMessage:123456" />
+        <select class="mode" aria-label="接收范围">
+          <option value="all">全部微博博主</option>
+          <option value="uids">仅指定博主</option>
+        </select>
+        <div class="uid-checklist" role="group" aria-label="订阅博主"></div>
+        <div class="deliveries">
+          <label><input class="receive-hotsearch" type="checkbox" /> 热搜</label>
+          <label><input class="receive-daily-summary" type="checkbox" /> 每日总结</label>
+        </div>
+        <button class="remove" type="button" aria-label="删除此会话">删除</button>
+      </article>
+    </template>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>
