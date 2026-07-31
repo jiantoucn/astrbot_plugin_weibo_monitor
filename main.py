@@ -23,6 +23,7 @@ DEFAULT_CHECK_INTERVAL = 10  # 默认检查间隔（分钟）
 DEFAULT_REQUEST_INTERVAL = 5  # 默认请求间隔（秒）
 DEFAULT_TIMEOUT = 20  # 默认HTTP请求超时（秒）
 MAX_CONCURRENT_REQUESTS = 5  # 最大并发请求数
+MAX_PUSH_QUEUE_SIZE = 100  # 推送队列最大积压条目数
 DEFAULT_MESSAGE_TEMPLATE = "🔔 {name} 发微博啦！\n\n{weibo}\n\n链接: {link}"
 WEIBO_API_BASE = "https://m.weibo.cn/api/container/getIndex"
 WEIBO_MOBILE_BASE = "https://m.weibo.cn"
@@ -45,15 +46,16 @@ CONFIG_GROUPS = {
 CONFIG_KEY_GROUPS = {key: group for group, keys in CONFIG_GROUPS.items() for key in keys}
 
 
-@register("astrbot_plugin_weibo_monitor", "Sayaka", "定时监控微博用户动态并推送到指定会话，支持按会话分组订阅不同博主。", "v1.19.2", "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor")
+@register("astrbot_plugin_weibo_monitor", "Sayaka", "定时监控微博用户动态并推送到指定会话，支持按会话分组订阅不同博主。", "v1.19.3", "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor")
 class WeiboMonitor(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
         self.config = config or {}
         self.monitor_task: Optional[asyncio.Task] = None
         self.push_consumer_task: Optional[asyncio.Task] = None
+        self._migrate_persist_task: Optional[asyncio.Task] = None
         self.cookie_invalid_notified = False # cookie 失效是否已通知
-        self.push_queue: asyncio.Queue = asyncio.Queue()
+        self.push_queue: asyncio.Queue = asyncio.Queue(maxsize=MAX_PUSH_QUEUE_SIZE)
 
         # 确保数据目录存在
         self.data_dir = StarTools.get_data_dir()
@@ -386,8 +388,16 @@ class WeiboMonitor(Star):
         }
         return self._save_data()
 
+    def _has_valid_subscription_mappings(self, mappings: Any) -> bool:
+        """判断订阅映射中是否至少存在一条页面格式可识别的有效配置。"""
+        if isinstance(mappings, str):
+            mappings = [item.strip() for item in mappings.splitlines() if item.strip()]
+        if not isinstance(mappings, list):
+            return False
+        return any(self._parse_mapping_for_page(item).get("valid", False) for item in mappings)
+
     def _restore_subscription_backup(self):
-        """仅在框架配置为空时恢复订阅快照，不覆盖用户已保存的新配置。"""
+        """框架配置为空或全部无效时恢复订阅快照，保留部分有效配置供用户修复。"""
         backup = self._data.get("_subscription_page_backup")
         if not isinstance(backup, dict):
             return
@@ -401,7 +411,9 @@ class WeiboMonitor(Star):
 
         restored = []
         current_mappings = self.config.get("subscription_mappings", [])
-        if not current_mappings and backup_mappings:
+        backup_mappings_valid = self._has_valid_subscription_mappings(backup_mappings)
+        current_mappings_valid = self._has_valid_subscription_mappings(current_mappings)
+        if backup_mappings and backup_mappings_valid and not current_mappings_valid:
             self.config["subscription_mappings"] = list(backup_mappings)
             restored.append("订阅分组")
 
@@ -416,7 +428,7 @@ class WeiboMonitor(Star):
             restored.append("监控博主")
 
         if restored:
-            self.plugin_logger.warning(f"检测到框架配置为空，已从订阅分组备份恢复：{'、'.join(restored)}")
+            self.plugin_logger.warning(f"检测到框架订阅配置为空或全部无效，已从备份恢复：{'、'.join(restored)}")
             self._save_plugin_config("订阅分组自动恢复")
 
     def _ensure_subscription_backup(self):
@@ -794,19 +806,20 @@ class WeiboMonitor(Star):
         """获取微博热搜榜数据，返回热搜条目列表"""
         try:
             self.plugin_logger.debug("正在获取微博热搜数据...")
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "application/json, text/plain, */*",
+                "Referer": "https://weibo.com/",
+            }
+
+            # 尝试不带 Cookie 获取；429 等待期间不占用请求信号量
             async with self._request_semaphore:
-                headers = {
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                    "Accept": "application/json, text/plain, */*",
-                    "Referer": "https://weibo.com/",
-                }
-                
-                # 尝试不带 Cookie 获取
                 resp = await self.client.get(HOTSEARCH_API_URL, headers=headers)
-                
-                if resp.status_code == 429:
-                    self.plugin_logger.warning("获取热搜数据触发限流 (429)，等待 60 秒后重试")
-                    await asyncio.sleep(60)
+
+            if resp.status_code == 429:
+                self.plugin_logger.warning("获取热搜数据触发限流 (429)，等待 60 秒后重试")
+                await asyncio.sleep(60)
+                async with self._request_semaphore:
                     resp = await self.client.get(HOTSEARCH_API_URL, headers=headers)
                 
                 need_cookie_fallback = False
@@ -931,7 +944,10 @@ class WeiboMonitor(Star):
         """从文件加载持久化数据，损坏时自动备份"""
         if self.data_file.exists():
             try:
-                return json.loads(self.data_file.read_text(encoding="utf-8"))
+                data = json.loads(self.data_file.read_text(encoding="utf-8"))
+                if not isinstance(data, dict):
+                    raise ValueError(f"持久化数据顶层类型必须是 dict，实际为 {type(data).__name__}")
+                return data
             except Exception as e:
                 self.plugin_logger.error(f"WeiboMonitor: 加载数据文件失败: {e}")
                 # 自动备份损坏的文件
@@ -984,6 +1000,10 @@ class WeiboMonitor(Star):
             return
 
         mappings = self.config.get("subscription_mappings", [])
+        if isinstance(mappings, str):
+            mappings = [item.strip() for item in mappings.splitlines() if item.strip()]
+        elif not isinstance(mappings, list):
+            mappings = []
         subscribed = self._get_all_subscribed_sessions()
 
         added = False
@@ -997,15 +1017,11 @@ class WeiboMonitor(Star):
             self.config["subscription_mappings"] = mappings
             self.config["target_conversation_id"] = []
             # 异步持久化到框架
-            asyncio.ensure_future(self._persist_migrated_config())
+            self._migrate_persist_task = asyncio.create_task(self._persist_migrated_config())
 
     async def _persist_migrated_config(self):
         """异步持久化迁移后的配置到框架存储。"""
-        try:
-            if hasattr(self.context, "config_manager") and hasattr(self.context.config_manager, "save_config"):
-                self.context.config_manager.save_config()
-        except Exception as e:
-            self.plugin_logger.warning(f"配置迁移后保存失败（不影响运行）: {e}")
+        await self._save_plugin_config_async("配置迁移后")
 
     def get_targets_legacy(self) -> List[str]:
         """读取旧版 target_conversation_id 配置（仅用于迁移）"""
@@ -1053,6 +1069,21 @@ class WeiboMonitor(Star):
                 await self.push_consumer_task
             except asyncio.CancelledError:
                 pass
+        if self._migrate_persist_task:
+            try:
+                await asyncio.wait_for(asyncio.shield(self._migrate_persist_task), timeout=5)
+            except asyncio.TimeoutError:
+                self.plugin_logger.warning("配置迁移保存超过 5 秒，停止等待并取消保存任务")
+                self._migrate_persist_task.cancel()
+                try:
+                    await self._migrate_persist_task
+                except asyncio.CancelledError:
+                    pass
+            except Exception as e:
+                self.plugin_logger.warning(f"等待配置迁移保存时出错: {e}")
+        pending_pushes = self.push_queue.qsize()
+        if pending_pushes:
+            self.plugin_logger.warning(f"插件停止时推送队列仍有 {pending_pushes} 条待处理消息，将不再发送")
         await self.client.aclose()
         self.plugin_logger.info("WeiboMonitor 插件已停止")
 
@@ -1955,12 +1986,6 @@ class WeiboMonitor(Star):
                 current_time_str = now.strftime("%H:%M")
                 current_date_str = now.strftime("%Y%m%d")
                 
-                # 重置错误计数和退避时间（正常运行时）
-                if self._consecutive_errors > 0:
-                    self._consecutive_errors = 0
-                    error_backoff = 60
-                    self.plugin_logger.info("WeiboMonitor: 连续错误已清除，恢复正常监控频率")
-                
                 retention = self._get_config("temp_media_retention_minutes", 10)
                 if retention > 0:
                     cleanup_interval = max(60, retention * 60)
@@ -2072,6 +2097,10 @@ class WeiboMonitor(Star):
                                 cycle_success = False
                             
                             if cycle_success:
+                                if self._consecutive_errors > 0:
+                                    self._consecutive_errors = 0
+                                    error_backoff = 60
+                                    self.plugin_logger.info("WeiboMonitor: 连续错误已清除，恢复正常监控频率")
                                 self.plugin_logger.info(f"本轮监控检查完成，下次检查将在约 {actual_interval} 分钟后")
                             else:
                                 self._consecutive_errors += 1
@@ -2080,7 +2109,8 @@ class WeiboMonitor(Star):
                     
                     last_check_time = asyncio.get_event_loop().time()
 
-                await asyncio.sleep(60)
+                # 监控周期失败时按指数退避；成功后恢复默认 60 秒轮询。
+                await asyncio.sleep(error_backoff if self._consecutive_errors > 0 else 60)
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -2140,8 +2170,10 @@ class WeiboMonitor(Star):
         与监控周期解耦，避免大文件下载阻塞检查节奏。
         """
         while True:
+            queue_item = None
             try:
-                post, targets, msg_format = await self.push_queue.get()
+                queue_item = await self.push_queue.get()
+                post, targets, msg_format = queue_item
                 self.plugin_logger.info(
                     f"[推送队列] 开始推送 {post.get('username')} 的微博，队列剩余 {self.push_queue.qsize()}"
                 )
@@ -2150,6 +2182,9 @@ class WeiboMonitor(Star):
                 break
             except Exception as e:
                 self.plugin_logger.error(f"[推送队列] 推送出错: {e}")
+            finally:
+                if queue_item is not None:
+                    self.push_queue.task_done()
 
     async def _send_new_posts(self, new_posts: List[dict], targets: List[str], msg_format: str, 
                                fallback_target: str = None, skip_log: bool = False):
@@ -2187,53 +2222,57 @@ class WeiboMonitor(Star):
         match_name = re.search(r"weibo\.(com|cn)/n/([^/?#]+)", url)
         if match_name:
             name = match_name.group(2)
-            async with self._request_semaphore:
-                try:
+            try:
+                async with self._request_semaphore:
                     resp = await self.client.get(
                         f"{WEIBO_MOBILE_BASE}/n/{name}",
                         headers=self.get_headers(),
                     )
-                    if resp.status_code == 429:
-                        self.plugin_logger.warning(f"WeiboMonitor: 解析用户名时触发限流 (429)，等待后重试")
-                        await asyncio.sleep(60)
+                if resp.status_code == 429:
+                    self.plugin_logger.warning(f"WeiboMonitor: 解析用户名时触发限流 (429)，等待后重试")
+                    await asyncio.sleep(60)
+                    async with self._request_semaphore:
                         resp = await self.client.get(
                             f"{WEIBO_MOBILE_BASE}/n/{name}",
                             headers=self.get_headers(),
                         )
-                    final_url = str(resp.url)
-                    match_uid = re.search(r"/u/(\d+)", final_url)
-                    if match_uid:
-                        return match_uid.group(1)
-                    self.plugin_logger.debug(f"WeiboMonitor: 用户名 {name} 跳转后无法解析UID，最终URL: {final_url}")
-                except Exception as e:
-                    self.plugin_logger.error(f"WeiboMonitor: 解析用户名 {name} 失败: {e}")
+                final_url = str(resp.url)
+                match_uid = re.search(r"/u/(\d+)", final_url)
+                if match_uid:
+                    return match_uid.group(1)
+                self.plugin_logger.debug(f"WeiboMonitor: 用户名 {name} 跳转后无法解析UID，最终URL: {final_url}")
+            except Exception as e:
+                self.plugin_logger.error(f"WeiboMonitor: 解析用户名 {name} 失败: {e}")
         return None
 
     async def _fetch_weibo_cards(self, uid: str) -> List[dict]:
         """获取指定UID的微博卡片列表"""
         api_url = f"{WEIBO_API_BASE}?type=uid&value={uid}&containerid=107603{uid}"
-        async with self._request_semaphore:
-            try:
+        try:
+            async with self._request_semaphore:
                 resp = await self.client.get(api_url, headers=self.get_headers(uid))
-                if resp.status_code == 429:
-                    self.plugin_logger.warning(f"WeiboMonitor: 触发限流 (429)，UID: {uid}，等待 60 秒后重试")
-                    await asyncio.sleep(60)
-                    resp = await self.client.get(api_url, headers=self.get_headers(uid))
-                if resp.status_code != 200:
-                    self.plugin_logger.error(f"WeiboMonitor: 接口请求失败 (状态码 {resp.status_code}), UID: {uid}")
-                    return []
-                try:
-                    data = resp.json()
-                except ValueError as e:
-                    self.plugin_logger.error(f"WeiboMonitor: 解析接口返回的JSON数据失败, UID: {uid}, 错误: {e}")
-                    return []
-                if data.get("ok") != 1:
-                    self.plugin_logger.debug(f"WeiboMonitor: 接口返回数据状态异常, UID: {uid}")
-                    return []
-                return (data.get("data") or {}).get("cards", [])
-            except Exception as e:
-                self.plugin_logger.error(f"WeiboMonitor: 获取UID {uid} 数据时出错: {e}")
+            if resp.status_code == 429:
+                self.plugin_logger.warning(f"WeiboMonitor: 触发限流 (429)，UID: {uid}，等待 60 秒后重试")
+                await asyncio.sleep(60)
+                async with self._request_semaphore:
+                    resp = await self.client.get(
+                        api_url, headers=self.get_headers(uid)
+                    )
+            if resp.status_code != 200:
+                self.plugin_logger.error(f"WeiboMonitor: 接口请求失败 (状态码 {resp.status_code}), UID: {uid}")
                 return []
+            try:
+                data = resp.json()
+            except ValueError as e:
+                self.plugin_logger.error(f"WeiboMonitor: 解析接口返回的JSON数据失败, UID: {uid}, 错误: {e}")
+                return []
+            if data.get("ok") != 1:
+                self.plugin_logger.debug(f"WeiboMonitor: 接口返回数据状态异常, UID: {uid}")
+                return []
+            return (data.get("data") or {}).get("cards", [])
+        except Exception as e:
+            self.plugin_logger.error(f"WeiboMonitor: 获取UID {uid} 数据时出错: {e}")
+            return []
 
     def _extract_valid_mblogs(self, cards: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], str]:
         """从卡片列表中提取有效的微博博文，并过滤置顶"""
