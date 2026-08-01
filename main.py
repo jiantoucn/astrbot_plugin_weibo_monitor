@@ -563,7 +563,7 @@ class WeiboMonitor(Star):
             )
 
     def _get_monitored_account_options(self) -> List[Dict[str, Any]]:
-        """返回带资料缓存的监控 UID，供页面展示头像、昵称和关注状态。"""
+        """返回带资料缓存的监控 UID，供页面展示头像和昵称。"""
         options = []
         seen_uids = set()
         profiles = self._get_account_profiles()
@@ -583,16 +583,6 @@ class WeiboMonitor(Star):
                         "avatar_url": self._safe_profile_url(
                             profile.get("avatar_url")
                         ),
-                        "verified": profile.get("verified") is True,
-                        "verified_reason": str(
-                            profile.get("verified_reason") or ""
-                        ).strip(),
-                        "following": profile.get("following")
-                        if isinstance(profile.get("following"), bool)
-                        else None,
-                        "follow_me": profile.get("follow_me")
-                        if isinstance(profile.get("follow_me"), bool)
-                        else None,
                         "updated_at": str(profile.get("updated_at") or ""),
                     }
                 )

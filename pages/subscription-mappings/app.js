@@ -92,13 +92,6 @@ function setAccountOptions(checklist, selectedUids = []) {
     text.textContent = account.label;
     label.prepend(input);
     label.append(text);
-    if (account.verified) {
-      const verified = document.createElement("span");
-      verified.className = "verified-mark";
-      verified.textContent = "V";
-      verified.title = account.verified_reason || "微博认证";
-      label.append(verified);
-    }
     return label;
   }));
 }
@@ -153,24 +146,6 @@ function renderMonitors() {
     const meta = document.createElement("small");
     meta.textContent = account ? `UID ${account.uid}` : url;
     details.append(name, meta);
-    if (account?.verified) {
-      const verified = document.createElement("span");
-      verified.className = "profile-badge verified";
-      verified.textContent = "已认证";
-      verified.title = account.verified_reason || "微博认证";
-      details.append(verified);
-    }
-    if (account?.following === true) {
-      const following = document.createElement("span");
-      following.className = "profile-badge following";
-      following.textContent = account.follow_me === true ? "互相关注" : "已关注";
-      details.append(following);
-    } else if (account?.follow_me === true) {
-      const followedBy = document.createElement("span");
-      followedBy.className = "profile-badge following";
-      followedBy.textContent = "对方关注你";
-      details.append(followedBy);
-    }
     const remove = document.createElement("button");
     remove.type = "button";
     remove.textContent = "×";
