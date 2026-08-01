@@ -77,7 +77,7 @@ CONFIG_KEY_GROUPS = {
     "astrbot_plugin_weibo_monitor",
     "Sayaka",
     "定时监控微博用户动态并推送到指定会话，支持按会话分组订阅不同博主。",
-    "v1.19.5",
+    "v1.19.6",
     "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor",
 )
 class WeiboMonitor(Star):
@@ -480,15 +480,112 @@ class WeiboMonitor(Star):
             is True,
         }
 
-    def _get_monitored_account_options(self) -> List[Dict[str, str]]:
-        """返回可用于订阅的已配置 UID，供页面以勾选列表展示。"""
+    def _get_account_profiles(self) -> Dict[str, Dict[str, Any]]:
+        """读取博主资料缓存，自动忽略旧版本或损坏的数据。"""
+        profiles = self._data.get("account_profiles", {})
+        if not isinstance(profiles, dict):
+            return {}
+        return {
+            str(uid): profile
+            for uid, profile in profiles.items()
+            if isinstance(profile, dict)
+        }
+
+    @staticmethod
+    def _safe_profile_url(value: Any) -> str:
+        """只接受微博资料中的 HTTP(S) 图片地址。"""
+        url = str(value or "").strip()
+        return url if re.match(r"^https?://", url, re.IGNORECASE) else ""
+
+    @staticmethod
+    def _optional_profile_bool(value: Any, fallback: Any = None) -> Optional[bool]:
+        """兼容微博接口可能返回的 bool 或 0/1，同时保留未知状态。"""
+        if isinstance(value, bool):
+            return value
+        if value in (0, 1):
+            return bool(value)
+        return fallback if isinstance(fallback, bool) else None
+
+    def _update_account_profile(self, uid: str, user: Any):
+        """从已有微博响应被动更新博主资料；失败不影响抓取和推送。"""
+        if not isinstance(user, dict):
+            return
+
+        profile_uid = str(user.get("idstr") or user.get("id") or uid).strip()
+        if not profile_uid or profile_uid != str(uid):
+            return
+
+        profiles = self._get_account_profiles()
+        previous = profiles.get(profile_uid, {})
+        screen_name = str(user.get("screen_name") or "").strip()
+        avatar_url = self._safe_profile_url(
+            user.get("avatar_hd")
+            or user.get("avatar_large")
+            or user.get("profile_image_url")
+        )
+        verified = self._optional_profile_bool(
+            user.get("verified"), previous.get("verified")
+        )
+        profile = {
+            "uid": profile_uid,
+            "screen_name": screen_name or str(previous.get("screen_name") or ""),
+            "avatar_url": avatar_url
+            or self._safe_profile_url(previous.get("avatar_url")),
+            "verified": verified is True,
+            "verified_type": user.get(
+                "verified_type", previous.get("verified_type")
+            ),
+            "verified_reason": str(
+                user.get("verified_reason", previous.get("verified_reason")) or ""
+            ).strip(),
+            "following": self._optional_profile_bool(
+                user.get("following"), previous.get("following")
+            ),
+            "follow_me": self._optional_profile_bool(
+                user.get("follow_me"), previous.get("follow_me")
+            ),
+        }
+        comparable_previous = {
+            key: previous.get(key) for key in profile if key != "uid"
+        }
+        comparable_profile = {
+            key: value for key, value in profile.items() if key != "uid"
+        }
+        if comparable_previous == comparable_profile:
+            return
+
+        profile["updated_at"] = self._get_utc8_now().strftime("%Y-%m-%d %H:%M:%S")
+        profiles[profile_uid] = profile
+        self._data["account_profiles"] = profiles
+        if not self._save_data():
+            self.plugin_logger.warning(
+                f"WeiboMonitor: UID {profile_uid} 的博主资料缓存保存失败"
+            )
+
+    def _get_monitored_account_options(self) -> List[Dict[str, Any]]:
+        """返回带资料缓存的监控 UID，供页面展示头像和昵称。"""
         options = []
         seen_uids = set()
+        profiles = self._get_account_profiles()
         for raw_url in self._parse_urls(self._get_config("weibo_urls", [])):
             uid = self._resolve_uid_from_config(raw_url)
             if uid and uid not in seen_uids:
                 seen_uids.add(uid)
-                options.append({"uid": uid, "label": f"UID {uid}"})
+                profile = profiles.get(uid, {})
+                screen_name = str(profile.get("screen_name") or "").strip()
+                options.append(
+                    {
+                        "uid": uid,
+                        "label": f"{screen_name} · UID {uid}"
+                        if screen_name
+                        else f"UID {uid}",
+                        "screen_name": screen_name,
+                        "avatar_url": self._safe_profile_url(
+                            profile.get("avatar_url")
+                        ),
+                        "updated_at": str(profile.get("updated_at") or ""),
+                    }
+                )
         return options
 
     def _normalize_monitored_urls(self, raw_values: Any) -> List[str]:
@@ -2863,6 +2960,14 @@ class WeiboMonitor(Star):
             if not cards:
                 self.plugin_logger.debug(f"UID {uid} 未获取到卡片数据")
                 return []
+
+            # 复用微博列表响应中的用户资料，不增加额外请求或 Cookie 压力。
+            for card in cards:
+                mblog = card.get("mblog") if isinstance(card, dict) else None
+                user = mblog.get("user") if isinstance(mblog, dict) else None
+                if isinstance(user, dict):
+                    self._update_account_profile(uid, user)
+                    break
 
             valid_mblogs, username = self._extract_valid_mblogs(cards)
             if not valid_mblogs:
