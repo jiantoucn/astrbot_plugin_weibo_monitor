@@ -77,7 +77,7 @@ CONFIG_KEY_GROUPS = {
     "astrbot_plugin_weibo_monitor",
     "Sayaka",
     "定时监控微博用户动态并推送到指定会话，支持按会话分组订阅不同博主。",
-    "v1.19.6",
+    "v1.19.7",
     "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor",
 )
 class WeiboMonitor(Star):
@@ -495,7 +495,22 @@ class WeiboMonitor(Star):
     def _safe_profile_url(value: Any) -> str:
         """只接受微博资料中的 HTTP(S) 图片地址。"""
         url = str(value or "").strip()
-        return url if re.match(r"^https?://", url, re.IGNORECASE) else ""
+        if url.lower().startswith("http://"):
+            url = f"https://{url[7:]}"
+        return url if url.lower().startswith("https://") else ""
+
+    @staticmethod
+    def _safe_avatar_data_url(value: Any) -> str:
+        """只向页面返回受支持的图片 Data URL。"""
+        data_url = str(value or "").strip()
+        return (
+            data_url
+            if re.match(
+                r"^data:image/(?:jpeg|png|gif|webp);base64,[A-Za-z0-9+/=]+$",
+                data_url,
+            )
+            else ""
+        )
 
     @staticmethod
     def _optional_profile_bool(value: Any, fallback: Any = None) -> Optional[bool]:
@@ -506,7 +521,52 @@ class WeiboMonitor(Star):
             return bool(value)
         return fallback if isinstance(fallback, bool) else None
 
-    def _update_account_profile(self, uid: str, user: Any):
+    async def _download_profile_avatar_data(
+        self, uid: str, avatar_url: str
+    ) -> str:
+        """携带微博 Referer 下载头像并转换为 Data URL，绕过浏览器防盗链。"""
+        if not avatar_url:
+            return ""
+        try:
+            headers = self.get_headers(uid)
+            headers["Accept"] = "image/avif,image/webp,image/png,image/jpeg,image/gif,*/*"
+            async with self._request_semaphore:
+                response = await self.client.get(avatar_url, headers=headers)
+            if response.status_code != 200:
+                self.plugin_logger.debug(
+                    f"WeiboMonitor: UID {uid} 头像下载失败，状态码: {response.status_code}"
+                )
+                return ""
+            content = response.content
+            if not content:
+                self.plugin_logger.debug(
+                    f"WeiboMonitor: UID {uid} 头像内容为空，已跳过缓存"
+                )
+                return ""
+            content_type = response.headers.get("Content-Type", "").split(";", 1)[
+                0
+            ].lower()
+            if content_type == "image/jpg":
+                content_type = "image/jpeg"
+            if content_type not in {
+                "image/jpeg",
+                "image/png",
+                "image/gif",
+                "image/webp",
+            }:
+                self.plugin_logger.debug(
+                    f"WeiboMonitor: UID {uid} 头像类型不受支持: {content_type}"
+                )
+                return ""
+            encoded = base64.b64encode(content).decode("ascii")
+            return f"data:{content_type};base64,{encoded}"
+        except Exception as error:
+            self.plugin_logger.debug(
+                f"WeiboMonitor: UID {uid} 头像缓存失败（不影响监控）: {error}"
+            )
+            return ""
+
+    async def _update_account_profile(self, uid: str, user: Any):
         """从已有微博响应被动更新博主资料；失败不影响抓取和推送。"""
         if not isinstance(user, dict):
             return
@@ -523,14 +583,25 @@ class WeiboMonitor(Star):
             or user.get("avatar_large")
             or user.get("profile_image_url")
         )
+        avatar_url = avatar_url or self._safe_profile_url(previous.get("avatar_url"))
+        previous_avatar_url = self._safe_profile_url(previous.get("avatar_url"))
+        avatar_data_url = (
+            self._safe_avatar_data_url(previous.get("avatar_data_url"))
+            if avatar_url == previous_avatar_url
+            else ""
+        )
+        if avatar_url and not avatar_data_url:
+            avatar_data_url = await self._download_profile_avatar_data(
+                profile_uid, avatar_url
+            )
         verified = self._optional_profile_bool(
             user.get("verified"), previous.get("verified")
         )
         profile = {
             "uid": profile_uid,
             "screen_name": screen_name or str(previous.get("screen_name") or ""),
-            "avatar_url": avatar_url
-            or self._safe_profile_url(previous.get("avatar_url")),
+            "avatar_url": avatar_url,
+            "avatar_data_url": avatar_data_url,
             "verified": verified is True,
             "verified_type": user.get(
                 "verified_type", previous.get("verified_type")
@@ -580,8 +651,8 @@ class WeiboMonitor(Star):
                         if screen_name
                         else f"UID {uid}",
                         "screen_name": screen_name,
-                        "avatar_url": self._safe_profile_url(
-                            profile.get("avatar_url")
+                        "avatar_url": self._safe_avatar_data_url(
+                            profile.get("avatar_data_url")
                         ),
                         "updated_at": str(profile.get("updated_at") or ""),
                     }
@@ -2966,7 +3037,7 @@ class WeiboMonitor(Star):
                 mblog = card.get("mblog") if isinstance(card, dict) else None
                 user = mblog.get("user") if isinstance(mblog, dict) else None
                 if isinstance(user, dict):
-                    self._update_account_profile(uid, user)
+                    await self._update_account_profile(uid, user)
                     break
 
             valid_mblogs, username = self._extract_valid_mblogs(cards)

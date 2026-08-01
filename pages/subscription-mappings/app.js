@@ -10,6 +10,22 @@ let monitoredAccounts = [];
 let monitorUrls = [];
 let statisticsDays = [];
 let selectedStatisticsDate = "";
+const defaultAvatarSvg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="32" fill="#e7eaf0"/><circle cx="32" cy="24" r="12" fill="#a7afbd"/><path d="M12 57c2-13 10-20 20-20s18 7 20 20" fill="#a7afbd"/></svg>`;
+const defaultAvatarUrl = `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(defaultAvatarSvg)}`;
+
+function createAccountAvatar(url, className = "account-avatar") {
+  const avatar = document.createElement("img");
+  avatar.className = className;
+  avatar.src = url || defaultAvatarUrl;
+  avatar.alt = "";
+  avatar.addEventListener("error", () => {
+    if (avatar.dataset.fallback !== "true") {
+      avatar.dataset.fallback = "true";
+      avatar.src = defaultAvatarUrl;
+    }
+  });
+  return avatar;
+}
 
 function renderRuntimeStatus(status = {}) {
   const lastPush = document.querySelector("#last-push-time");
@@ -79,15 +95,7 @@ function setAccountOptions(checklist, selectedUids = []) {
     input.type = "checkbox";
     input.value = account.uid;
     input.checked = selected.has(account.uid);
-    if (account.avatar_url) {
-      const avatar = document.createElement("img");
-      avatar.className = "account-avatar small";
-      avatar.src = account.avatar_url;
-      avatar.alt = "";
-      avatar.referrerPolicy = "no-referrer";
-      avatar.addEventListener("error", () => avatar.remove());
-      label.append(avatar);
-    }
+    label.append(createAccountAvatar(account.avatar_url, "account-avatar small"));
     const text = document.createElement("span");
     text.textContent = account.label;
     label.prepend(input);
@@ -130,15 +138,7 @@ function renderMonitors() {
       : null;
     const item = document.createElement("span");
     item.className = "monitor-chip";
-    if (account?.avatar_url) {
-      const avatar = document.createElement("img");
-      avatar.className = "account-avatar";
-      avatar.src = account.avatar_url;
-      avatar.alt = "";
-      avatar.referrerPolicy = "no-referrer";
-      avatar.addEventListener("error", () => avatar.remove());
-      item.append(avatar);
-    }
+    item.append(createAccountAvatar(account?.avatar_url));
     const details = document.createElement("span");
     details.className = "monitor-details";
     const name = document.createElement("strong");
