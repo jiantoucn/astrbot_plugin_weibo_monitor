@@ -77,7 +77,7 @@ CONFIG_KEY_GROUPS = {
     "astrbot_plugin_weibo_monitor",
     "Sayaka",
     "定时监控微博用户动态并推送到指定会话，支持按会话分组订阅不同博主。",
-    "v1.19.4",
+    "v1.19.5",
     "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor",
 )
 class WeiboMonitor(Star):
@@ -165,6 +165,18 @@ class WeiboMonitor(Star):
                 self.plugin_logger.warning(
                     "WeiboMonitor: 未配置微博Cookie，插件无法正常工作！请在插件设置中填写weibo_cookie。"
                 )
+
+        # 页面状态只读展示：不参与监控决策，避免状态接口异常影响主循环。
+        configured_cookie = bool(self._get_config("weibo_cookie", ""))
+        self.cookie_health_status = (
+            self._data.get("_cookie_health_status", "unknown")
+            if configured_cookie
+            else "unconfigured"
+        )
+        self.cookie_health_checked_at = self._data.get(
+            "_cookie_health_checked_at", ""
+        )
+        self.next_push_time = ""
 
         self.last_summary_date = self._data.get("last_summary_date", "")
         self.last_hotsearch_time = 0
@@ -324,6 +336,45 @@ class WeiboMonitor(Star):
             ["GET"],
             "获取微博推送统计",
         )
+        self.context.register_web_api(
+            f"/{PLUGIN_NAME}/config-export",
+            self.get_config_export,
+            ["GET"],
+            "导出微博监控配置命令",
+        )
+        self.context.register_web_api(
+            f"/{PLUGIN_NAME}/runtime-status",
+            self.get_runtime_status,
+            ["GET"],
+            "获取微博监控运行状态",
+        )
+
+    def _build_export_command(self) -> str:
+        """生成与 /weibo_export 相同格式的导入命令。"""
+        legacy_keys = set(CONFIG_KEY_GROUPS) | {
+            "_config_schema_version",
+            "target_conversation_id",
+        }
+        export_config = {
+            key: value
+            for key, value in self.config.items()
+            if key not in legacy_keys
+        }
+        config_json = json.dumps(export_config, ensure_ascii=False)
+        config_b64 = base64.b64encode(config_json.encode("utf-8")).decode("utf-8")
+        return f"/weibo_import {config_b64}"
+
+    async def get_config_export(self):
+        """供 Plugin Page 获取配置导入命令；不写日志，避免 Cookie 泄露。"""
+        try:
+            return json_response({"command": self._build_export_command()})
+        except Exception as error:
+            self.plugin_logger.error(f"WeiboMonitor: 页面导出配置失败: {error}")
+            return error_response("导出配置失败，请查看插件日志", status_code=500)
+
+    async def get_runtime_status(self):
+        """供 Plugin Page 定时刷新运行状态。"""
+        return json_response(self._get_runtime_status_for_page())
 
     @staticmethod
     def _is_complete_subscription_reference(item: str) -> bool:
@@ -567,8 +618,40 @@ class WeiboMonitor(Star):
                 "invalid_rows": [item for item in parsed if not item["valid"]],
                 "monitored_accounts": self._get_monitored_account_options(),
                 "monitor_urls": self._parse_urls(self._get_config("weibo_urls", [])),
+                "runtime_status": self._get_runtime_status_for_page(),
             }
         )
+
+    @staticmethod
+    def _display_status_time(value: Any) -> str:
+        """将持久化时间转换为页面显示的 HH:MM:SS，避免暴露多余信息。"""
+        if not value:
+            return ""
+        text = str(value).strip()
+        try:
+            return datetime.fromisoformat(text).strftime("%H:%M:%S")
+        except ValueError:
+            match = re.search(r"(\d{2}:\d{2}:\d{2})", text)
+            return match.group(1) if match else ""
+
+    def _get_runtime_status_for_page(self) -> Dict[str, str]:
+        """返回页面所需的最小运行状态，不执行网络请求。"""
+        cookie_configured = bool(self._get_config("weibo_cookie", ""))
+        cookie_status = (
+            self.cookie_health_status if cookie_configured else "unconfigured"
+        )
+        if cookie_status not in {"valid", "invalid", "unknown", "unconfigured"}:
+            cookie_status = "unknown"
+        return {
+            "last_push_time": self._display_status_time(
+                self._data.get("last_push_time", "")
+            ),
+            "next_push_time": self._display_status_time(self.next_push_time),
+            "cookie_status": cookie_status,
+            "cookie_checked_at": self._display_status_time(
+                self.cookie_health_checked_at
+            ),
+        }
 
     def _build_push_statistics(self, days: int = 7) -> List[Dict[str, Any]]:
         """从每日推送记录中汇总近几天的时段分布和账号排行。"""
@@ -1508,8 +1591,13 @@ class WeiboMonitor(Star):
             except Exception as e:
                 self.plugin_logger.error(f"WeiboMonitor: 推送到 {target} 失败: {e}")
 
-        if successful_targets and not skip_log:
-            self._log_to_daily_file(post, delivery_count=successful_targets)
+        if successful_targets:
+            self._data["last_push_time"] = self._get_utc8_now().strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+            self._save_data()
+            if not skip_log:
+                self._log_to_daily_file(post, delivery_count=successful_targets)
 
         # 视频下载和推送
         video_path = None
@@ -1725,17 +1813,8 @@ class WeiboMonitor(Star):
     async def weibo_export(self, event: AstrMessageEvent):
         """导出当前插件配置"""
         try:
-            legacy_keys = set(CONFIG_KEY_GROUPS) | {
-                "_config_schema_version",
-                "target_conversation_id",
-            }
-            export_config = {
-                key: value
-                for key, value in self.config.items()
-                if key not in legacy_keys
-            }
-            config_json = json.dumps(export_config, ensure_ascii=False)
-            config_b64 = base64.b64encode(config_json.encode("utf-8")).decode("utf-8")
+            command = self._build_export_command()
+            config_b64 = command.split(" ", 1)[1]
             yield event.plain_result(
                 f"📦 WeiboMonitor 配置导出成功 (Base64格式):\n\n{config_b64}\n\n"
                 f"💡 请妥善保管此字符串，在其他会话或环境中使用 /weibo_import [配置字符串] 即可导入。"
@@ -1799,6 +1878,7 @@ class WeiboMonitor(Star):
             # 兜底：如果导入的配置包含 Cookie，同步写入 _data 持久化文件
             imported_cookie = self._get_config("weibo_cookie", "")
             if imported_cookie:
+                self._set_cookie_health_status("unknown")
                 self._data["_backup_weibo_cookie"] = imported_cookie
                 self._save_data()
 
@@ -1827,6 +1907,7 @@ class WeiboMonitor(Star):
                 data = resp.json()
                 data_obj = data.get("data") or {}
                 if data_obj.get("login"):
+                    self._set_cookie_health_status("valid")
                     user = data_obj.get("user")
                     if user:
                         yield event.plain_result(
@@ -1838,12 +1919,15 @@ class WeiboMonitor(Star):
                             f"✅ Cookie 有效！\n已登录但未获取到详细用户信息 (UID: {uid})"
                         )
                 else:
+                    self._set_cookie_health_status("invalid")
                     yield event.plain_result(
                         "❌ Cookie 已失效或未登录（接口返回 login: false）。"
                     )
             else:
+                self._set_cookie_health_status("invalid")
                 yield event.plain_result(f"❌ 验证请求失败，状态码: {resp.status_code}")
         except Exception as e:
+            self._set_cookie_health_status("invalid")
             self.plugin_logger.error(f"WeiboMonitor: 验证过程中出现错误: {e}")
             yield event.plain_result(f"❌ 验证过程中出现错误: {e}")
 
@@ -1864,6 +1948,7 @@ class WeiboMonitor(Star):
 
         self._set_config("weibo_cookie", cookie)
         self.cookie_invalid_notified = False
+        self._set_cookie_health_status("unknown")
 
         try:
             if hasattr(self.context, "config_manager") and hasattr(
@@ -1892,6 +1977,7 @@ class WeiboMonitor(Star):
                 data = resp.json()
                 data_obj = data.get("data") or {}
                 if data_obj.get("login"):
+                    self._set_cookie_health_status("valid")
                     user = data_obj.get("user")
                     user_info = (
                         f"当前登录用户: {user.get('screen_name')} (UID: {user.get('id')})"
@@ -1931,14 +2017,17 @@ class WeiboMonitor(Star):
                             "⚠️ 自动重载失败，请手动在 WebUI 插件管理中点击「重载插件」。\n💡 新 Cookie 已生效，无需重载亦可正常使用。"
                         )
                 else:
+                    self._set_cookie_health_status("invalid")
                     yield event.plain_result(
                         "❌ Cookie 已更新但验证失败（接口返回 login: false），请检查 Cookie 是否正确。"
                     )
             else:
+                self._set_cookie_health_status("invalid")
                 yield event.plain_result(
                     f"❌ Cookie 已更新但验证请求失败，状态码: {resp.status_code}"
                 )
         except Exception as e:
+            self._set_cookie_health_status("invalid")
             self.plugin_logger.error(f"WeiboMonitor: 更换 Cookie 后验证出错: {e}")
             yield event.plain_result(f"❌ Cookie 已更新但验证过程出错: {e}")
 
@@ -2284,6 +2373,22 @@ class WeiboMonitor(Star):
             self.plugin_logger.debug(f"WeiboMonitor: 检查 Cookie 健康状态失败: {e}")
             return False
 
+    def _set_cookie_health_status(self, status: str):
+        """更新 Cookie 健康状态，供页面展示；状态保存失败不影响监控。"""
+        if status not in {"valid", "invalid", "unknown", "unconfigured"}:
+            status = "unknown"
+        checked_at = self._get_utc8_now().strftime("%Y-%m-%d %H:%M:%S")
+        changed = (
+            getattr(self, "cookie_health_status", "unknown") != status
+            or not getattr(self, "cookie_health_checked_at", "")
+        )
+        self.cookie_health_status = status
+        self.cookie_health_checked_at = checked_at
+        if changed and hasattr(self, "_data"):
+            self._data["_cookie_health_status"] = status
+            self._data["_cookie_health_checked_at"] = checked_at
+            self._save_data()
+
     async def run_monitor(self):
         """后台监控主循环"""
         self.plugin_logger.info("微博监控任务已启动")
@@ -2401,6 +2506,9 @@ class WeiboMonitor(Star):
                     else:
                         # 检查 Cookie 健康
                         is_cookie_healthy = await self._check_cookie_health()
+                        self._set_cookie_health_status(
+                            "valid" if is_cookie_healthy else "invalid"
+                        )
                         if not is_cookie_healthy:
                             if not self.cookie_invalid_notified:
                                 self.plugin_logger.warning(
@@ -2504,6 +2612,10 @@ class WeiboMonitor(Star):
                                 )
 
                     last_check_time = asyncio.get_event_loop().time()
+                    self.next_push_time = (
+                        self._get_utc8_now()
+                        + timedelta(minutes=actual_interval)
+                    ).strftime("%Y-%m-%d %H:%M:%S")
 
                 # 监控周期失败时按指数退避；成功后恢复默认 60 秒轮询。
                 await asyncio.sleep(
