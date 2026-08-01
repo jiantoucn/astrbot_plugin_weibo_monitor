@@ -79,9 +79,26 @@ function setAccountOptions(checklist, selectedUids = []) {
     input.type = "checkbox";
     input.value = account.uid;
     input.checked = selected.has(account.uid);
+    if (account.avatar_url) {
+      const avatar = document.createElement("img");
+      avatar.className = "account-avatar small";
+      avatar.src = account.avatar_url;
+      avatar.alt = "";
+      avatar.referrerPolicy = "no-referrer";
+      avatar.addEventListener("error", () => avatar.remove());
+      label.append(avatar);
+    }
     const text = document.createElement("span");
     text.textContent = account.label;
-    label.append(input, text);
+    label.prepend(input);
+    label.append(text);
+    if (account.verified) {
+      const verified = document.createElement("span");
+      verified.className = "verified-mark";
+      verified.textContent = "V";
+      verified.title = account.verified_reason || "微博认证";
+      label.append(verified);
+    }
     return label;
   }));
 }
@@ -91,6 +108,14 @@ function toAccountOption(raw) {
   if (/^\d+$/.test(value)) return { uid: value, label: `UID ${value}` };
   const match = value.match(/weibo\.(?:com|cn)\/u\/(\d+)/);
   return match ? { uid: match[1], label: `UID ${match[1]}` } : null;
+}
+
+function rebuildMonitoredAccounts() {
+  const cached = new Map(monitoredAccounts.map((account) => [account.uid, account]));
+  monitoredAccounts = monitorUrls.map(toAccountOption).filter(Boolean).map((account) => ({
+    ...account,
+    ...(cached.get(account.uid) || {}),
+  }));
 }
 
 function refreshAccountSelectors() {
@@ -106,21 +131,57 @@ function renderMonitors() {
   const empty = document.querySelector("#monitor-empty");
   list.replaceChildren();
   monitorUrls.forEach((url) => {
+    const basicAccount = toAccountOption(url);
+    const account = basicAccount
+      ? monitoredAccounts.find((item) => item.uid === basicAccount.uid) || basicAccount
+      : null;
     const item = document.createElement("span");
     item.className = "monitor-chip";
-    const text = document.createElement("code");
-    text.textContent = url;
+    if (account?.avatar_url) {
+      const avatar = document.createElement("img");
+      avatar.className = "account-avatar";
+      avatar.src = account.avatar_url;
+      avatar.alt = "";
+      avatar.referrerPolicy = "no-referrer";
+      avatar.addEventListener("error", () => avatar.remove());
+      item.append(avatar);
+    }
+    const details = document.createElement("span");
+    details.className = "monitor-details";
+    const name = document.createElement("strong");
+    name.textContent = account?.screen_name || account?.label || url;
+    const meta = document.createElement("small");
+    meta.textContent = account ? `UID ${account.uid}` : url;
+    details.append(name, meta);
+    if (account?.verified) {
+      const verified = document.createElement("span");
+      verified.className = "profile-badge verified";
+      verified.textContent = "已认证";
+      verified.title = account.verified_reason || "微博认证";
+      details.append(verified);
+    }
+    if (account?.following === true) {
+      const following = document.createElement("span");
+      following.className = "profile-badge following";
+      following.textContent = account.follow_me === true ? "互相关注" : "已关注";
+      details.append(following);
+    } else if (account?.follow_me === true) {
+      const followedBy = document.createElement("span");
+      followedBy.className = "profile-badge following";
+      followedBy.textContent = "对方关注你";
+      details.append(followedBy);
+    }
     const remove = document.createElement("button");
     remove.type = "button";
     remove.textContent = "×";
     remove.setAttribute("aria-label", `移除 ${url}`);
     remove.addEventListener("click", () => {
       monitorUrls = monitorUrls.filter((item) => item !== url);
-      monitoredAccounts = monitorUrls.map(toAccountOption).filter(Boolean);
+      rebuildMonitoredAccounts();
       renderMonitors();
       refreshAccountSelectors();
     });
-    item.append(text, remove);
+    item.append(details, remove);
     list.append(item);
   });
   empty.hidden = monitorUrls.length > 0;
@@ -135,7 +196,7 @@ function addMonitor() {
     return;
   }
   monitorUrls.push(raw);
-  monitoredAccounts = monitorUrls.map(toAccountOption).filter(Boolean);
+  rebuildMonitoredAccounts();
   input.value = "";
   renderMonitors();
   refreshAccountSelectors();
@@ -278,7 +339,7 @@ saveButton.addEventListener("click", async () => {
     const result = await bridge.apiPost("subscription-mappings", { rows: readRows(), monitor_urls: monitorUrls });
     setStatus(`已保存 ${result.rows.length} 个会话配置。`, "success");
     monitorUrls = result.monitor_urls || monitorUrls;
-    monitoredAccounts = monitorUrls.map(toAccountOption).filter(Boolean);
+    rebuildMonitoredAccounts();
     renderMonitors();
     refreshAccountSelectors();
     invalidRows = [];
