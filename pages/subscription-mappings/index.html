@@ -21,6 +21,18 @@
         先在下方添加要监控的微博 UID 或主页链接；再将这些博主分配给会话。会话 ID 可通过在目标群聊或私聊发送 <code>/weibo_umo</code> 获取。
       </section>
 
+      <section class="runtime-card">
+        <div class="section-heading runtime-heading">
+          <div><h2>运行状态</h2><p>状态由后台监控任务更新；下次时间为预计的下一轮检查时间。</p></div>
+          <button id="export-config" class="button secondary" type="button">复制配置备份命令</button>
+        </div>
+        <div class="runtime-grid">
+          <div class="runtime-item"><span>上次微博推送</span><strong id="last-push-time">暂无记录</strong></div>
+          <div class="runtime-item"><span>下次微博检查（预计）</span><strong id="next-push-time">等待监控任务启动</strong></div>
+          <div class="runtime-item cookie-runtime"><span>Cookie 状态</span><strong><i id="cookie-status-dot" class="status-dot status-unknown"></i><span id="cookie-status">待验证</span></strong><small id="cookie-checked-at"></small></div>
+        </div>
+      </section>
+
       <section class="monitor-card">
         <div class="section-heading">
           <div><h2>监控博主</h2><p>支持纯数字 UID、`weibo.com/u/UID` 或 `weibo.com/n/用户名` 主页链接。</p></div>

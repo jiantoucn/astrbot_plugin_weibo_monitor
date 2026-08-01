@@ -3,12 +3,56 @@ const rowsElement = document.querySelector("#rows");
 const template = document.querySelector("#row-template");
 const emptyState = document.querySelector("#empty-state");
 const saveButton = document.querySelector("#save");
+const exportButton = document.querySelector("#export-config");
 const statusElement = document.querySelector("#status");
 let invalidRows = [];
 let monitoredAccounts = [];
 let monitorUrls = [];
 let statisticsDays = [];
 let selectedStatisticsDate = "";
+
+function renderRuntimeStatus(status = {}) {
+  const lastPush = document.querySelector("#last-push-time");
+  const nextPush = document.querySelector("#next-push-time");
+  const cookieStatus = document.querySelector("#cookie-status");
+  const cookieDot = document.querySelector("#cookie-status-dot");
+  const checkedAt = document.querySelector("#cookie-checked-at");
+  const cookieLabels = {
+    valid: "已生效",
+    invalid: "已失效",
+    unconfigured: "未配置",
+    unknown: "待验证",
+  };
+  const cookieClasses = {
+    valid: "status-valid",
+    invalid: "status-invalid",
+    unconfigured: "status-unconfigured",
+    unknown: "status-unknown",
+  };
+  const cookieState = cookieClasses[status.cookie_status] ? status.cookie_status : "unknown";
+  lastPush.textContent = status.last_push_time || "暂无记录";
+  nextPush.textContent = status.next_push_time || "等待监控任务启动";
+  cookieStatus.textContent = cookieLabels[cookieState];
+  cookieDot.className = `status-dot ${cookieClasses[cookieState]}`;
+  checkedAt.textContent = status.cookie_checked_at ? `最近检查 ${status.cookie_checked_at}` : "尚未检查";
+}
+
+async function copyText(text) {
+  if (navigator.clipboard && window.isSecureContext) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  document.body.append(textarea);
+  textarea.focus();
+  textarea.select();
+  const copied = document.execCommand("copy");
+  textarea.remove();
+  if (!copied) throw new Error("浏览器拒绝了复制操作");
+}
 
 function setStatus(message, tone = "") {
   statusElement.textContent = message;
@@ -194,6 +238,7 @@ async function load() {
     const data = await bridge.apiGet("subscription-mappings");
     monitorUrls = data.monitor_urls || [];
     monitoredAccounts = data.monitored_accounts || monitorUrls.map(toAccountOption).filter(Boolean);
+    renderRuntimeStatus(data.runtime_status);
     renderMonitors();
     (data.rows || []).forEach(addRow);
     invalidRows = data.invalid_rows || [];
@@ -207,6 +252,14 @@ async function load() {
     }
   } catch (error) {
     setStatus(`加载失败：${error.message}`, "error");
+  }
+}
+
+async function refreshRuntimeStatus() {
+  try {
+    renderRuntimeStatus(await bridge.apiGet("runtime-status"));
+  } catch (error) {
+    // 状态刷新失败不影响订阅配置页面的使用。
   }
 }
 
@@ -237,4 +290,20 @@ saveButton.addEventListener("click", async () => {
   }
 });
 
+exportButton.addEventListener("click", async () => {
+  exportButton.disabled = true;
+  setStatus("正在生成配置备份命令…");
+  try {
+    const result = await bridge.apiGet("config-export");
+    if (!result.command) throw new Error("服务端未返回导入命令");
+    await copyText(result.command);
+    setStatus("配置备份命令已复制。请将它粘贴到新配置的插件会话中执行，以恢复配置。", "success");
+  } catch (error) {
+    setStatus(`配置备份复制失败：${error.message}`, "error");
+  } finally {
+    exportButton.disabled = false;
+  }
+});
+
 load();
+setInterval(refreshRuntimeStatus, 30000);
