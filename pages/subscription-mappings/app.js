@@ -36,21 +36,40 @@ function renderRuntimeStatus(status = {}) {
   const cookieLabels = {
     valid: "已生效",
     invalid: "已失效",
+    error: "暂时无法验证",
     unconfigured: "未配置",
     unknown: "待验证",
   };
   const cookieClasses = {
     valid: "status-valid",
     invalid: "status-invalid",
+    error: "status-error",
     unconfigured: "status-unconfigured",
     unknown: "status-unknown",
   };
   const cookieState = cookieClasses[status.cookie_status] ? status.cookie_status : "unknown";
   lastPush.textContent = status.last_push_time || "暂无记录";
-  nextPush.textContent = status.next_push_time || "等待监控任务启动";
+  nextPush.textContent = status.next_push_label || status.next_push_time || "等待监控任务启动";
   cookieStatus.textContent = cookieLabels[cookieState];
   cookieDot.className = `status-dot ${cookieClasses[cookieState]}`;
   checkedAt.textContent = status.cookie_checked_at ? `最近检查 ${status.cookie_checked_at}` : "尚未检查";
+
+  const readinessElement = document.querySelector("#weibo-readiness");
+  const readiness = status.weibo_readiness;
+  if (!readiness || !readiness.state) {
+    readinessElement.hidden = true;
+    return;
+  }
+  const stateLabels = { ready: "已就绪", degraded: "部分就绪", pending: "待验证", blocked: "未就绪" };
+  readinessElement.hidden = false;
+  readinessElement.className = `readiness-notice readiness-${readiness.state}`;
+  document.querySelector("#weibo-readiness-title").textContent = `微博动态推送：${readiness.label || stateLabels[readiness.state] || "状态未知"}`;
+  const issues = [...(readiness.blockers || []), ...(readiness.warnings || [])];
+  document.querySelector("#weibo-readiness-issues").replaceChildren(...issues.map((issue) => {
+    const item = document.createElement("li");
+    item.textContent = `${issue.message} ${issue.action}`;
+    return item;
+  }));
 }
 
 async function copyText(text) {
@@ -312,7 +331,13 @@ saveButton.addEventListener("click", async () => {
   setStatus("正在保存…");
   try {
     const result = await bridge.apiPost("subscription-mappings", { rows: readRows(), monitor_urls: monitorUrls });
-    setStatus(`已保存 ${result.rows.length} 个会话配置。`, "success");
+    const readiness = result.runtime_status && result.runtime_status.weibo_readiness;
+    if (result.runtime_status) renderRuntimeStatus(result.runtime_status);
+    if (readiness && readiness.state !== "ready") {
+      setStatus(`已保存 ${result.rows.length} 个会话配置，但微博动态推送${readiness.label || "尚未就绪"}。请查看上方原因。`, "warning");
+    } else {
+      setStatus(`已保存 ${result.rows.length} 个会话配置。`, "success");
+    }
     monitorUrls = result.monitor_urls || monitorUrls;
     rebuildMonitoredAccounts();
     renderMonitors();

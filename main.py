@@ -4,6 +4,7 @@ import httpx
 import os
 import json
 import base64
+import hashlib
 import inspect
 import random
 import logging
@@ -77,7 +78,7 @@ CONFIG_KEY_GROUPS = {
     "astrbot_plugin_weibo_monitor",
     "Sayaka",
     "定时监控微博用户动态并推送到指定会话，支持按会话分组订阅不同博主。",
-    "v1.19.7",
+    "v1.19.8",
     "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor",
 )
 class WeiboMonitor(Star):
@@ -163,19 +164,30 @@ class WeiboMonitor(Star):
                 self.plugin_logger.info("WeiboMonitor: 从持久化数据中恢复了微博 Cookie")
             else:
                 self.plugin_logger.warning(
-                    "WeiboMonitor: 未配置微博Cookie，插件无法正常工作！请在插件设置中填写weibo_cookie。"
+                    "WeiboMonitor: 未配置微博 Cookie，微博动态自动监控将暂停；免 Cookie 热搜等独立功能不受此提示影响。"
                 )
 
-        # 页面状态只读展示：不参与监控决策，避免状态接口异常影响主循环。
-        configured_cookie = bool(self._get_config("weibo_cookie", ""))
-        self.cookie_health_status = (
-            self._data.get("_cookie_health_status", "unknown")
-            if configured_cookie
-            else "unconfigured"
-        )
-        self.cookie_health_checked_at = self._data.get(
-            "_cookie_health_checked_at", ""
-        )
+        # Cookie 内容变化后必须重新验证，不能沿用旧 Cookie 的健康状态。
+        configured_cookie = self._get_cookie_value()
+        cookie_fingerprint = self._cookie_fingerprint(configured_cookie)
+        stored_fingerprint = self._data.get("_cookie_fingerprint", "")
+        if not configured_cookie:
+            self.cookie_health_status = "unconfigured"
+            self.cookie_health_checked_at = ""
+        elif stored_fingerprint != cookie_fingerprint:
+            self.cookie_health_status = "unknown"
+            self.cookie_health_checked_at = ""
+            self._data["_cookie_fingerprint"] = cookie_fingerprint
+            self._data["_cookie_health_status"] = "unknown"
+            self._data["_cookie_health_checked_at"] = ""
+            self._save_data()
+        else:
+            self.cookie_health_status = self._data.get(
+                "_cookie_health_status", "unknown"
+            )
+            self.cookie_health_checked_at = self._data.get(
+                "_cookie_health_checked_at", ""
+            )
         self.next_push_time = ""
 
         self.last_summary_date = self._data.get("last_summary_date", "")
@@ -356,9 +368,7 @@ class WeiboMonitor(Star):
             "target_conversation_id",
         }
         export_config = {
-            key: value
-            for key, value in self.config.items()
-            if key not in legacy_keys
+            key: value for key, value in self.config.items() if key not in legacy_keys
         }
         config_json = json.dumps(export_config, ensure_ascii=False)
         config_b64 = base64.b64encode(config_json.encode("utf-8")).decode("utf-8")
@@ -521,15 +531,15 @@ class WeiboMonitor(Star):
             return bool(value)
         return fallback if isinstance(fallback, bool) else None
 
-    async def _download_profile_avatar_data(
-        self, uid: str, avatar_url: str
-    ) -> str:
+    async def _download_profile_avatar_data(self, uid: str, avatar_url: str) -> str:
         """携带微博 Referer 下载头像并转换为 Data URL，绕过浏览器防盗链。"""
         if not avatar_url:
             return ""
         try:
             headers = self.get_headers(uid)
-            headers["Accept"] = "image/avif,image/webp,image/png,image/jpeg,image/gif,*/*"
+            headers["Accept"] = (
+                "image/avif,image/webp,image/png,image/jpeg,image/gif,*/*"
+            )
             async with self._request_semaphore:
                 response = await self.client.get(avatar_url, headers=headers)
             if response.status_code != 200:
@@ -543,9 +553,9 @@ class WeiboMonitor(Star):
                     f"WeiboMonitor: UID {uid} 头像内容为空，已跳过缓存"
                 )
                 return ""
-            content_type = response.headers.get("Content-Type", "").split(";", 1)[
-                0
-            ].lower()
+            content_type = (
+                response.headers.get("Content-Type", "").split(";", 1)[0].lower()
+            )
             if content_type == "image/jpg":
                 content_type = "image/jpeg"
             if content_type not in {
@@ -603,9 +613,7 @@ class WeiboMonitor(Star):
             "avatar_url": avatar_url,
             "avatar_data_url": avatar_data_url,
             "verified": verified is True,
-            "verified_type": user.get(
-                "verified_type", previous.get("verified_type")
-            ),
+            "verified_type": user.get("verified_type", previous.get("verified_type")),
             "verified_reason": str(
                 user.get("verified_reason", previous.get("verified_reason")) or ""
             ).strip(),
@@ -802,23 +810,317 @@ class WeiboMonitor(Star):
             match = re.search(r"(\d{2}:\d{2}:\d{2})", text)
             return match.group(1) if match else ""
 
-    def _get_runtime_status_for_page(self) -> Dict[str, str]:
+    def _get_cookie_value(self) -> str:
+        """返回去除首尾空白后的 Cookie，避免空白字符串被误判为已配置。"""
+        value = self._get_config("weibo_cookie", "")
+        return str(value).strip() if value is not None else ""
+
+    @staticmethod
+    def _cookie_fingerprint(cookie: str) -> str:
+        """生成不可逆 Cookie 指纹，用于判断健康状态是否仍对应当前配置。"""
+        if not cookie:
+            return ""
+        return hashlib.sha256(cookie.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _parse_notification_targets(value: Any) -> List[str]:
+        """解析管理通知目标，兼容字符串、列表及逗号分隔格式。"""
+        raw_items = value if isinstance(value, list) else [value]
+        targets = []
+        for raw_item in raw_items:
+            for item in str(raw_item or "").split(","):
+                target = item.strip()
+                if target and target not in targets:
+                    targets.append(target)
+        return targets
+
+    def _get_management_notification_targets(
+        self, *, fallback_to_subscriptions: bool
+    ) -> List[str]:
+        """返回管理提醒目标；显式目标优先，必要时回退到全部有效订阅会话。"""
+        configured = self._parse_notification_targets(
+            self._get_config("cookie_notification_target", "")
+        )
+        if configured:
+            return configured
+        if fallback_to_subscriptions:
+            return sorted(self._get_all_subscribed_sessions())
+        return []
+
+    def _get_weibo_push_readiness(self) -> Dict[str, Any]:
+        """统一计算微博动态自动推送就绪状态，不执行网络请求。"""
+        cookie = self._get_cookie_value()
+        cookie_status = self.cookie_health_status if cookie else "unconfigured"
+        if cookie_status not in {
+            "valid",
+            "invalid",
+            "unknown",
+            "error",
+            "unconfigured",
+        }:
+            cookie_status = "unknown"
+        if cookie and cookie_status == "unconfigured":
+            cookie_status = "unknown"
+
+        monitor_urls = self._parse_urls(self._get_config("weibo_urls", []))
+        sessions = self._get_all_subscribed_sessions()
+        wildcard_sessions = set(self.get_targets())
+        resolved_uids = []
+        unresolved_monitors = 0
+        for monitor in monitor_urls:
+            uid = self._resolve_uid_from_config(monitor)
+            if uid:
+                if uid not in resolved_uids:
+                    resolved_uids.append(uid)
+            else:
+                unresolved_monitors += 1
+
+        routed_uids = [uid for uid in resolved_uids if self._get_targets_for_uid(uid)]
+        blockers = []
+        warnings = []
+
+        if not cookie:
+            blockers.append(
+                {
+                    "code": "cookie_unconfigured",
+                    "message": "未配置微博 Cookie，微博动态自动监控已暂停。",
+                    "action": "到插件设置的“微博账号与认证”填写，或使用 /weibo_cookie。",
+                }
+            )
+        elif cookie_status == "invalid":
+            blockers.append(
+                {
+                    "code": "cookie_invalid",
+                    "message": "微博 Cookie 已失效，微博动态自动监控已暂停。",
+                    "action": "更新 Cookie 后使用 /weibo_verify 验证。",
+                }
+            )
+
+        if not monitor_urls:
+            blockers.append(
+                {
+                    "code": "no_monitors",
+                    "message": "尚未添加监控博主。",
+                    "action": "打开插件详情页的“订阅分组管理”，添加监控博主。",
+                }
+            )
+        if not sessions:
+            blockers.append(
+                {
+                    "code": "no_sessions",
+                    "message": "尚未配置有效的接收会话。",
+                    "action": "打开插件详情页的“订阅分组管理”，添加会话并保存。",
+                }
+            )
+        elif (
+            monitor_urls
+            and not wildcard_sessions
+            and resolved_uids
+            and not routed_uids
+            and unresolved_monitors == 0
+        ):
+            blockers.append(
+                {
+                    "code": "no_effective_route",
+                    "message": "现有分组没有接收任何已监控博主。",
+                    "action": "在“订阅分组管理”中勾选对应博主，或选择“全部微博博主”。",
+                }
+            )
+        elif (
+            sessions
+            and not wildcard_sessions
+            and resolved_uids
+            and len(routed_uids) < len(resolved_uids)
+        ):
+            warnings.append(
+                {
+                    "code": "partial_route_coverage",
+                    "message": f"有 {len(resolved_uids) - len(routed_uids)} 个已解析博主没有接收会话。",
+                    "action": "在“订阅分组管理”中补充这些博主的接收范围。",
+                }
+            )
+
+        if unresolved_monitors and not wildcard_sessions:
+            warnings.append(
+                {
+                    "code": "unresolved_monitors",
+                    "message": f"有 {unresolved_monitors} 个用户名主页需要抓取后才能确认分组路由。",
+                    "action": "可使用“全部微博博主”，或等待首次成功解析后再检查状态。",
+                }
+            )
+
+        if blockers:
+            state = "blocked"
+            label = "未就绪"
+        elif cookie_status in {"unknown", "error"}:
+            state = "pending"
+            label = "待验证" if cookie_status == "unknown" else "暂时无法验证"
+        elif warnings:
+            state = "degraded"
+            label = "部分就绪"
+        else:
+            state = "ready"
+            label = "已就绪"
+
+        if cookie and cookie_status == "unknown":
+            warnings.insert(
+                0,
+                {
+                    "code": "cookie_pending",
+                    "message": "Cookie 已配置，尚未完成本次验证。",
+                    "action": "等待下一轮检查，或使用 /weibo_verify 立即验证。",
+                },
+            )
+        elif cookie and cookie_status == "error":
+            warnings.insert(
+                0,
+                {
+                    "code": "cookie_check_error",
+                    "message": "Cookie 暂时无法验证，可能是网络或微博接口异常。",
+                    "action": "稍后重试 /weibo_verify；无需立即更换 Cookie。",
+                },
+            )
+
+        return {
+            "state": state,
+            "label": label,
+            "blockers": blockers,
+            "warnings": warnings,
+            "cookie_status": cookie_status,
+            "monitor_count": len(monitor_urls),
+            "resolved_monitor_count": len(resolved_uids),
+            "routed_monitor_count": len(routed_uids),
+            "unresolved_monitor_count": unresolved_monitors,
+            "session_count": len(sessions),
+            "wildcard_session_count": len(wildcard_sessions),
+        }
+
+    async def _send_text_to_targets(
+        self, targets: List[str], content: str, *, reason: str
+    ) -> Tuple[List[str], List[str]]:
+        """逐目标主动发送文本，并返回成功与失败目标。"""
+        successful = []
+        failed = []
+        chain = MessageChain().message(content)
+        for target in dict.fromkeys(targets):
+            try:
+                result = await self.context.send_message(target, chain)
+                if result is False:
+                    raise RuntimeError("AstrBot 未找到匹配的消息平台")
+                successful.append(target)
+            except Exception as e:
+                failed.append(target)
+                self.plugin_logger.warning(f"{reason}发送到 {target} 失败: {e}")
+        return successful, failed
+
+    async def _send_daily_configuration_reminder(self):
+        """发送配置缺口提醒；每个目标每天至多尝试一次。"""
+        cookie = self._get_cookie_value()
+        sessions = self._get_all_subscribed_sessions()
+
+        if not cookie and sessions:
+            targets = self._get_management_notification_targets(
+                fallback_to_subscriptions=True
+            )
+            content = (
+                "⚠️ 微博监控配置提醒：尚未填写微博 Cookie，微博动态自动监控已暂停。\n"
+                "请到插件设置的“微博账号与认证”填写 Cookie，或使用 /weibo_cookie 更新。\n"
+                "此提醒表示“未配置”，与 Cookie 已配置但失效的通知不同。"
+            )
+        elif cookie and not sessions:
+            targets = self._get_management_notification_targets(
+                fallback_to_subscriptions=False
+            )
+            content = (
+                "⚠️ 微博监控配置提醒：Cookie 已配置，但尚未配置订阅分组，"
+                "自动检查的微博动态将没有接收会话。\n"
+                "请打开本插件详情页的“订阅分组管理”，添加会话并保存。"
+            )
+        else:
+            return
+
+        today = self._get_utc8_now().strftime("%Y%m%d")
+        if not targets:
+            if self._data.get("_configuration_reminder_unroutable_date") != today:
+                self.plugin_logger.warning(
+                    "WeiboMonitor: 检测到配置未就绪，但没有可用的管理通知目标；"
+                    "请通过订阅分组页面或 /weibo_status 查看详情"
+                )
+                self._data["_configuration_reminder_unroutable_date"] = today
+                self._save_data()
+            return
+
+        reminder_dates = self._data.get("_configuration_reminder_target_dates", {})
+        if not isinstance(reminder_dates, dict):
+            reminder_dates = {}
+        pending_targets = [
+            target for target in targets if reminder_dates.get(target) != today
+        ]
+        if not pending_targets:
+            return
+
+        previous_dates = dict(reminder_dates)
+        for target in pending_targets:
+            reminder_dates[target] = today
+        self._data["_configuration_reminder_target_dates"] = reminder_dates
+        if not self._save_data():
+            self._data["_configuration_reminder_target_dates"] = previous_dates
+            self.plugin_logger.error(
+                "WeiboMonitor: 无法持久化配置提醒日期，为避免重复提醒，本次不发送"
+            )
+            return
+
+        successful, failed = await self._send_text_to_targets(
+            pending_targets, content, reason="配置缺口提醒"
+        )
+        if successful:
+            self.plugin_logger.info(
+                f"WeiboMonitor: 已向 {len(successful)}/{len(pending_targets)} 个目标发送配置缺口提醒"
+            )
+        if failed:
+            self.plugin_logger.warning(
+                f"WeiboMonitor: 有 {len(failed)} 个目标未收到配置缺口提醒"
+            )
+
+    def _get_runtime_status_for_page(self) -> Dict[str, Any]:
         """返回页面所需的最小运行状态，不执行网络请求。"""
-        cookie_configured = bool(self._get_config("weibo_cookie", ""))
+        cookie_configured = bool(self._get_cookie_value())
         cookie_status = (
             self.cookie_health_status if cookie_configured else "unconfigured"
         )
-        if cookie_status not in {"valid", "invalid", "unknown", "unconfigured"}:
+        if cookie_status not in {
+            "valid",
+            "invalid",
+            "unknown",
+            "error",
+            "unconfigured",
+        }:
             cookie_status = "unknown"
+        readiness = self._get_weibo_push_readiness()
+        next_push_label = ""
+        paused_codes = {
+            "cookie_unconfigured",
+            "cookie_invalid",
+            "no_monitors",
+            "no_sessions",
+        }
+        if (
+            readiness["state"] == "blocked"
+            and readiness["blockers"]
+            and readiness["blockers"][0]["code"] in paused_codes
+        ):
+            next_push_label = f"已暂停：{readiness['blockers'][0]['message']}"
         return {
             "last_push_time": self._display_status_time(
                 self._data.get("last_push_time", "")
             ),
             "next_push_time": self._display_status_time(self.next_push_time),
+            "next_push_label": next_push_label,
             "cookie_status": cookie_status,
             "cookie_checked_at": self._display_status_time(
                 self.cookie_health_checked_at
             ),
+            "weibo_readiness": readiness,
         }
 
     def _build_push_statistics(self, days: int = 7) -> List[Dict[str, Any]]:
@@ -970,7 +1272,12 @@ class WeiboMonitor(Star):
                 "订阅分组未能写入 AstrBot 配置，请重试并查看插件日志", status_code=500
             )
         return json_response(
-            {"saved": True, "rows": serialized, "monitor_urls": normalized_monitor_urls}
+            {
+                "saved": True,
+                "rows": serialized,
+                "monitor_urls": normalized_monitor_urls,
+                "runtime_status": self._get_runtime_status_for_page(),
+            }
         )
 
     def _get_utc8_now(self) -> datetime:
@@ -1472,7 +1779,7 @@ class WeiboMonitor(Star):
 
     def get_headers(self, uid: str = "") -> Dict[str, str]:
         """获取请求头"""
-        cookie = self._get_config("weibo_cookie", "")
+        cookie = self._get_cookie_value()
         headers = {
             "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/604.1",
             "Accept": "application/json, text/plain, */*",
@@ -1728,48 +2035,83 @@ class WeiboMonitor(Star):
 
     async def _send_post_to_targets(
         self, post: dict, msg_format: str, targets: List[str], skip_log: bool = False
-    ) -> int:
+    ) -> Dict[str, Any]:
         """发送单条微博到指定目标。
         文字与图片分别独立发送，解决飞书适配器图文混合消息文字丢失问题（统一应用于所有平台）。
-        返回实际发送的图片数量。
+        返回正文和媒体的结构化发送结果，供命令准确展示 X/Y。
         """
+        attempted_targets = list(dict.fromkeys(targets))
         text_content = self._format_post_text(post, msg_format)
 
         # 图片下载和推送
+        image_enabled = self._get_config("enable_image_download", True)
+        image_urls = list(post.get("image_urls", []))
+        max_images = self._get_config("max_images_per_post", 0)
+        if max_images > 0:
+            image_urls = image_urls[:max_images]
+        image_requested_count = len(image_urls) if image_enabled else 0
         image_paths: List[str] = []
-        if self._get_config("enable_image_download", True):
+        if image_enabled:
             image_paths = await self._download_post_images(post)
 
         # 文字与图片分别独立发送，解决飞书适配器图文混合消息文字丢失问题。
         # 所有平台统一采用此方式。
         text_chain = MessageChain().message(text_content)
 
+        img_chain = None
+        image_component_failed = False
         if image_paths:
-            img_chain = MessageChain()
-            for img_path in image_paths:
-                img_chain.chain.append(Comp.Image(file=img_path))
-
-        successful_targets = 0
-        for target in targets:
             try:
-                await self.context.send_message(target, text_chain)
-                successful_targets += 1
-                if image_paths:
-                    await self.context.send_message(target, img_chain)
+                img_chain = MessageChain()
+                for img_path in image_paths:
+                    img_chain.chain.append(Comp.Image(file=img_path))
             except Exception as e:
-                self.plugin_logger.error(f"WeiboMonitor: 推送到 {target} 失败: {e}")
+                image_component_failed = True
+                self.plugin_logger.error(f"WeiboMonitor: 构造图片消息失败: {e}")
 
-        if successful_targets:
+        successful_text_targets = []
+        failed_text_targets = []
+        successful_image_targets = []
+        image_failed_targets = []
+        for target in attempted_targets:
+            try:
+                result = await self.context.send_message(target, text_chain)
+                if result is False:
+                    raise RuntimeError("AstrBot 未找到匹配的消息平台")
+                successful_text_targets.append(target)
+            except Exception as e:
+                failed_text_targets.append(target)
+                self.plugin_logger.error(f"WeiboMonitor: 正文推送到 {target} 失败: {e}")
+                continue
+
+            if img_chain is not None:
+                try:
+                    result = await self.context.send_message(target, img_chain)
+                    if result is False:
+                        raise RuntimeError("AstrBot 未找到匹配的消息平台")
+                    successful_image_targets.append(target)
+                except Exception as e:
+                    image_failed_targets.append(target)
+                    self.plugin_logger.error(
+                        f"WeiboMonitor: 图片推送到 {target} 失败: {e}"
+                    )
+
+        if successful_text_targets:
             self._data["last_push_time"] = self._get_utc8_now().strftime(
                 "%Y-%m-%d %H:%M:%S"
             )
             self._save_data()
             if not skip_log:
-                self._log_to_daily_file(post, delivery_count=successful_targets)
+                self._log_to_daily_file(
+                    post, delivery_count=len(successful_text_targets)
+                )
 
         # 视频下载和推送
+        video_enabled = self._get_config("enable_video_download", True)
+        video_available = bool(post.get("video_info"))
         video_path = None
-        if self._get_config("enable_video_download", True) and post.get("video_info"):
+        video_download_failed = False
+        if video_enabled and video_available:
             self.plugin_logger.info(
                 f"检测到视频微博，开始下载: {post.get('link', 'unknown')}"
             )
@@ -1786,31 +2128,72 @@ class WeiboMonitor(Star):
                     f"视频下载超时（{dl_timeout}秒），已跳过: {post.get('link', 'unknown')}"
                 )
                 video_path = None
-        post["_video_sent"] = video_path is not None
-
+                video_download_failed = True
+            except Exception as e:
+                self.plugin_logger.error(f"WeiboMonitor: 视频下载失败: {e}")
+                video_download_failed = True
+            if not video_path:
+                video_download_failed = True
+        successful_video_targets = []
+        video_failed_targets = []
+        video_component_failed = False
         if video_path:
             send_timeout = self._get_config("video_send_timeout", 60)
-            video_chain = MessageChain()
-            video_chain.chain.append(Comp.Video.fromFileSystem(path=video_path))
-            for target in targets:
+            try:
+                video_chain = MessageChain()
+                video_chain.chain.append(Comp.Video.fromFileSystem(path=video_path))
+            except Exception as e:
+                video_chain = None
+                video_component_failed = True
+                self.plugin_logger.error(f"WeiboMonitor: 构造视频消息失败: {e}")
+            for target in successful_text_targets:
+                if video_chain is None:
+                    break
                 try:
                     if send_timeout > 0:
-                        await asyncio.wait_for(
+                        result = await asyncio.wait_for(
                             self.context.send_message(target, video_chain),
                             timeout=send_timeout,
                         )
                     else:
-                        await self.context.send_message(target, video_chain)
+                        result = await self.context.send_message(target, video_chain)
+                    if result is False:
+                        raise RuntimeError("AstrBot 未找到匹配的消息平台")
+                    successful_video_targets.append(target)
                 except asyncio.TimeoutError:
+                    video_failed_targets.append(target)
                     self.plugin_logger.warning(
                         f"视频推送到 {target} 超时（{send_timeout}秒）"
                     )
                 except Exception as e:
+                    video_failed_targets.append(target)
                     self.plugin_logger.error(
                         f"WeiboMonitor: 视频推送到 {target} 失败: {e}"
                     )
+        post["_video_sent"] = bool(successful_video_targets)
 
-        return len(image_paths)
+        return {
+            "attempted_targets": attempted_targets,
+            "successful_text_targets": successful_text_targets,
+            "failed_text_targets": failed_text_targets,
+            "image_count": len(image_paths) if successful_image_targets else 0,
+            "image_requested_count": image_requested_count,
+            "image_downloaded_count": len(image_paths),
+            "successful_image_targets": successful_image_targets,
+            "image_failed_targets": image_failed_targets,
+            "video_available": video_available,
+            "video_enabled": video_enabled,
+            "successful_video_targets": successful_video_targets,
+            "video_failed_targets": video_failed_targets,
+            "media_partial_failure": bool(
+                image_failed_targets
+                or image_component_failed
+                or image_requested_count > len(image_paths)
+                or video_failed_targets
+                or video_component_failed
+                or video_download_failed
+            ),
+        }
 
     @staticmethod
     def _parse_bid_from_url(url: str) -> Optional[Tuple[str, Optional[str]]]:
@@ -2074,7 +2457,8 @@ class WeiboMonitor(Star):
             if resp.status_code == 200:
                 data = resp.json()
                 data_obj = data.get("data") or {}
-                if data_obj.get("login"):
+                login = data_obj.get("login")
+                if login is True:
                     self._set_cookie_health_status("valid")
                     user = data_obj.get("user")
                     if user:
@@ -2086,18 +2470,25 @@ class WeiboMonitor(Star):
                         yield event.plain_result(
                             f"✅ Cookie 有效！\n已登录但未获取到详细用户信息 (UID: {uid})"
                         )
-                else:
+                elif login is False:
                     self._set_cookie_health_status("invalid")
                     yield event.plain_result(
                         "❌ Cookie 已失效或未登录（接口返回 login: false）。"
                     )
+                else:
+                    self._set_cookie_health_status("error")
+                    yield event.plain_result(
+                        "⚠️ 微博接口返回了无法识别的登录状态，暂时不能判断 Cookie 是否有效，请稍后重试。"
+                    )
             else:
-                self._set_cookie_health_status("invalid")
-                yield event.plain_result(f"❌ 验证请求失败，状态码: {resp.status_code}")
+                self._set_cookie_health_status("error")
+                yield event.plain_result(
+                    f"⚠️ 暂时无法验证 Cookie，接口状态码: {resp.status_code}。请稍后重试。"
+                )
         except Exception as e:
-            self._set_cookie_health_status("invalid")
+            self._set_cookie_health_status("error")
             self.plugin_logger.error(f"WeiboMonitor: 验证过程中出现错误: {e}")
-            yield event.plain_result(f"❌ 验证过程中出现错误: {e}")
+            yield event.plain_result(f"⚠️ 暂时无法验证 Cookie: {e}")
 
     @filter.command("weibo_cookie")
     async def weibo_cookie(self, event: AstrMessageEvent, cookie: str = ""):
@@ -2144,7 +2535,8 @@ class WeiboMonitor(Star):
             if resp.status_code == 200:
                 data = resp.json()
                 data_obj = data.get("data") or {}
-                if data_obj.get("login"):
+                login = data_obj.get("login")
+                if login is True:
                     self._set_cookie_health_status("valid")
                     user = data_obj.get("user")
                     user_info = (
@@ -2160,8 +2552,15 @@ class WeiboMonitor(Star):
                     self.plugin_logger.info(
                         f"WeiboMonitor: Cookie 已通过命令更换，{save_msg}"
                     )
+                    next_step = ""
+                    if not self._get_all_subscribed_sessions():
+                        next_step = (
+                            "\n⚠️ 还需打开本插件详情页的“订阅分组管理”，"
+                            "添加接收会话并保存，否则自动检查的微博动态无人接收。"
+                        )
                     yield event.plain_result(
                         f"✅ Cookie 更换成功！{user_info}\n{save_msg}\n"
+                        f"{next_step}\n"
                         f"🔄 正在重载插件..."
                     )
                     try:
@@ -2184,20 +2583,86 @@ class WeiboMonitor(Star):
                         yield event.plain_result(
                             "⚠️ 自动重载失败，请手动在 WebUI 插件管理中点击「重载插件」。\n💡 新 Cookie 已生效，无需重载亦可正常使用。"
                         )
-                else:
+                elif login is False:
                     self._set_cookie_health_status("invalid")
                     yield event.plain_result(
                         "❌ Cookie 已更新但验证失败（接口返回 login: false），请检查 Cookie 是否正确。"
                     )
+                else:
+                    self._set_cookie_health_status("error")
+                    yield event.plain_result(
+                        "⚠️ Cookie 已更新，但微博接口返回了无法识别的登录状态。新 Cookie 已保存，请稍后使用 /weibo_verify 重试。"
+                    )
             else:
-                self._set_cookie_health_status("invalid")
+                self._set_cookie_health_status("error")
                 yield event.plain_result(
-                    f"❌ Cookie 已更新但验证请求失败，状态码: {resp.status_code}"
+                    f"⚠️ Cookie 已更新，但暂时无法验证，接口状态码: {resp.status_code}。新 Cookie 已保存，请稍后使用 /weibo_verify 重试。"
                 )
         except Exception as e:
-            self._set_cookie_health_status("invalid")
+            self._set_cookie_health_status("error")
             self.plugin_logger.error(f"WeiboMonitor: 更换 Cookie 后验证出错: {e}")
-            yield event.plain_result(f"❌ Cookie 已更新但验证过程出错: {e}")
+            yield event.plain_result(
+                f"⚠️ Cookie 已更新，但暂时无法完成验证: {e}。请稍后使用 /weibo_verify 重试。"
+            )
+
+    def _format_manual_delivery_message(
+        self,
+        username: str,
+        delivery: Dict[str, Any],
+        current_target: str,
+        *,
+        has_any_sessions: bool,
+        has_uid_targets: bool,
+    ) -> str:
+        """根据真实正文发送结果生成手动检查提示。"""
+        post_results = delivery.get("post_results", [])
+        if not post_results:
+            return f"❌ {username}：已获取最新动态，但没有可用的发送目标。"
+
+        result = post_results[0]
+        attempted_targets = result.get("attempted_targets", [])
+        successful_targets = result.get("successful_text_targets", [])
+        success_count = len(successful_targets)
+        attempted_count = len(attempted_targets)
+        media_note = (
+            " 图片或视频部分发送失败。" if result.get("media_partial_failure") else ""
+        )
+
+        if delivery.get("used_fallback"):
+            if success_count:
+                if not has_any_sessions:
+                    return (
+                        f"✅ {username}：本次仅测试发送到当前会话；"
+                        f"自动推送分组尚未配置。{media_note}"
+                    )
+                if not has_uid_targets:
+                    return (
+                        f"⚠️ {username}：现有分组没有接收该博主，"
+                        f"本次仅测试发送到当前会话；自动监控不会推送该博主。{media_note}"
+                    )
+            return f"❌ {username}：已获取最新动态，但正文发送到当前会话失败。"
+
+        if success_count == attempted_count:
+            prefix = "✅"
+            delivery_text = (
+                f"正文已成功提交到 {success_count}/{attempted_count} 个订阅会话"
+            )
+        elif success_count:
+            prefix = "⚠️"
+            delivery_text = (
+                f"正文仅成功提交到 {success_count}/{attempted_count} 个订阅会话"
+            )
+        else:
+            prefix = "❌"
+            delivery_text = f"正文未能提交到任何订阅会话（0/{attempted_count}）"
+
+        if current_target in successful_targets:
+            current_note = "当前会话已接收。"
+        elif current_target in attempted_targets:
+            current_note = "当前会话投递失败。"
+        else:
+            current_note = "当前会话不在该博主的接收范围。"
+        return f"{prefix} {username}：{delivery_text}；{current_note}{media_note}"
 
     @filter.command("weibo_check")
     async def weibo_check(self, event: AstrMessageEvent):
@@ -2205,6 +2670,17 @@ class WeiboMonitor(Star):
         urls = self._parse_urls(self._get_config("weibo_urls", []))
         if not urls:
             yield event.plain_result("❌ 未在插件设置中配置监控URL。")
+            return
+
+        if not self._get_cookie_value():
+            yield event.plain_result(
+                "❌ 未配置微博 Cookie，无法执行微博动态检查。请先在插件设置中填写，或使用 /weibo_cookie。"
+            )
+            return
+        if self.cookie_health_status == "invalid":
+            yield event.plain_result(
+                "❌ 微博 Cookie 已失效。请更新 Cookie 后使用 /weibo_verify 验证。"
+            )
             return
 
         yield event.plain_result("🔍 正在检查首个微博账号的最新动态...")
@@ -2219,8 +2695,9 @@ class WeiboMonitor(Star):
 
         latest_posts = await self.check_weibo(uid, force_fetch=True)
         if latest_posts:
+            all_sessions = self._get_all_subscribed_sessions()
             uid_targets = self._get_targets_for_uid(uid)
-            await self._send_new_posts(
+            delivery = await self._send_new_posts(
                 latest_posts,
                 uid_targets,
                 msg_format,
@@ -2228,7 +2705,13 @@ class WeiboMonitor(Star):
                 skip_log=True,
             )
             yield event.plain_result(
-                f"✅ {latest_posts[0].get('username')} 已发送最新动态。"
+                self._format_manual_delivery_message(
+                    latest_posts[0].get("username", "未知用户"),
+                    delivery,
+                    event.unified_msg_origin,
+                    has_any_sessions=bool(all_sessions),
+                    has_uid_targets=bool(uid_targets),
+                )
             )
         else:
             yield event.plain_result(f"ℹ️ UID {uid} 未获取到有效微博。")
@@ -2246,6 +2729,17 @@ class WeiboMonitor(Star):
 
         if not urls:
             yield event.plain_result("❌ 未在插件设置中配置监控URL。")
+            return
+
+        if not self._get_cookie_value():
+            yield event.plain_result(
+                "❌ 未配置微博 Cookie，无法执行微博动态检查。请先在插件设置中填写，或使用 /weibo_cookie。"
+            )
+            return
+        if self.cookie_health_status == "invalid":
+            yield event.plain_result(
+                "❌ 微博 Cookie 已失效。请更新 Cookie 后使用 /weibo_verify 验证。"
+            )
             return
 
         yield event.plain_result(f"🔍 正在立即检查 {len(urls)} 个微博账号的最新动态...")
@@ -2268,15 +2762,24 @@ class WeiboMonitor(Star):
 
             latest_posts = await self.check_weibo(uid, force_fetch=True)
             if latest_posts:
+                all_sessions = self._get_all_subscribed_sessions()
                 uid_targets = self._get_targets_for_uid(uid)
-                await self._send_new_posts(
+                delivery = await self._send_new_posts(
                     latest_posts,
                     uid_targets,
                     msg_format,
                     event.unified_msg_origin,
                     skip_log=True,
                 )
-                results.append(f"✅ {latest_posts[0].get('username')} 已发送最新动态。")
+                results.append(
+                    self._format_manual_delivery_message(
+                        latest_posts[0].get("username", "未知用户"),
+                        delivery,
+                        event.unified_msg_origin,
+                        has_any_sessions=bool(all_sessions),
+                        has_uid_targets=bool(uid_targets),
+                    )
+                )
             else:
                 results.append(f"ℹ️ UID {uid} 未获取到有效微博。")
 
@@ -2330,14 +2833,31 @@ class WeiboMonitor(Star):
         check_interval = self._get_config("check_interval", DEFAULT_CHECK_INTERVAL)
         status_lines.append(f"- 检查间隔：{check_interval} 分钟")
 
-        cookie = self._get_config("weibo_cookie", "")
-        cookie_status = "✅ 已配置" if cookie else "❌ 未配置"
-        status_lines.append(f"- Cookie：{cookie_status}")
-
-        has_active_push = bool(all_sessions and cookie)
+        readiness = self._get_weibo_push_readiness()
+        cookie_labels = {
+            "valid": "✅ 有效",
+            "invalid": "❌ 已失效",
+            "unknown": "⏳ 待验证",
+            "error": "⚠️ 暂时无法验证",
+            "unconfigured": "❌ 未配置",
+        }
         status_lines.append(
-            f"- 自动推送：{'✅ 开启' if has_active_push else '❌ 关闭'}"
+            f"- Cookie：{cookie_labels.get(readiness['cookie_status'], '⏳ 待验证')}"
         )
+        readiness_icons = {
+            "ready": "✅",
+            "degraded": "⚠️",
+            "pending": "⏳",
+            "blocked": "⛔",
+        }
+        status_lines.append(
+            f"- 微博动态推送：{readiness_icons[readiness['state']]} {readiness['label']}"
+        )
+        if readiness["state"] != "ready":
+            issues = readiness["blockers"] + readiness["warnings"]
+            for index, issue in enumerate(issues, start=1):
+                status_lines.append(f"  {index}. {issue['message']}")
+                status_lines.append(f"     → {issue['action']}")
 
         daily_summary = self._get_config("enable_daily_summary", False)
         if daily_summary:
@@ -2505,19 +3025,37 @@ class WeiboMonitor(Star):
             targets = [event.unified_msg_origin]
 
         msg_format = self.message_format
-        actual_images = await self._send_post_to_targets(
+        delivery = await self._send_post_to_targets(
             post, msg_format, targets, skip_log=True
         )
 
+        actual_images = delivery["image_count"]
         image_info = f"，含 {actual_images} 张图片" if actual_images > 0 else ""
         video_info_text = ""
         if post.get("video_info"):
-            video_info_text = (
-                "，含视频" if post.get("_video_sent") else "，视频下载失败"
-            )
+            if not delivery.get("video_enabled"):
+                video_info_text = "，视频发送未启用"
+            else:
+                video_info_text = (
+                    "，含视频" if post.get("_video_sent") else "，视频未成功发送"
+                )
 
+        success_count = len(delivery["successful_text_targets"])
+        attempted_count = len(delivery["attempted_targets"])
+        if success_count == attempted_count:
+            prefix = "✅"
+            delivery_text = f"正文已成功提交到 {success_count}/{attempted_count} 个目标"
+        elif success_count:
+            prefix = "⚠️"
+            delivery_text = f"正文仅成功提交到 {success_count}/{attempted_count} 个目标"
+        else:
+            prefix = "❌"
+            delivery_text = f"正文未能提交到任何目标（0/{attempted_count}）"
+        media_note = (
+            "，图片或视频部分发送失败" if delivery["media_partial_failure"] else ""
+        )
         yield event.plain_result(
-            f"✅ 已向 {len(targets)} 个目标推送 {post.get('username')} 的微博{image_info}{video_info_text}。"
+            f"{prefix} {post.get('username')} 的微博{delivery_text}{image_info}{video_info_text}{media_note}。"
         )
 
     @property
@@ -2527,34 +3065,47 @@ class WeiboMonitor(Star):
             "\\n", "\n"
         )
 
-    async def _check_cookie_health(self) -> bool:
-        """检查 Cookie 有效性"""
+    async def _check_cookie_health(self) -> str:
+        """检查 Cookie 健康状态，区分明确失效与临时验证错误。"""
         try:
             resp = await self.client.get(
                 f"{WEIBO_MOBILE_BASE}/api/config", headers=self.get_headers()
             )
             if resp.status_code == 200:
                 data = resp.json()
-                return bool((data.get("data") or {}).get("login"))
-            return False
+                login = (data.get("data") or {}).get("login")
+                if login is True:
+                    return "valid"
+                if login is False:
+                    return "invalid"
+                self.plugin_logger.warning(
+                    "WeiboMonitor: Cookie 健康检查响应缺少明确的 login 布尔值"
+                )
+                return "error"
+            self.plugin_logger.warning(
+                f"WeiboMonitor: Cookie 健康检查请求失败，状态码: {resp.status_code}"
+            )
+            return "error"
         except Exception as e:
             self.plugin_logger.debug(f"WeiboMonitor: 检查 Cookie 健康状态失败: {e}")
-            return False
+            return "error"
 
     def _set_cookie_health_status(self, status: str):
         """更新 Cookie 健康状态，供页面展示；状态保存失败不影响监控。"""
-        if status not in {"valid", "invalid", "unknown", "unconfigured"}:
+        if status not in {"valid", "invalid", "unknown", "error", "unconfigured"}:
             status = "unknown"
         checked_at = self._get_utc8_now().strftime("%Y-%m-%d %H:%M:%S")
-        changed = (
-            getattr(self, "cookie_health_status", "unknown") != status
-            or not getattr(self, "cookie_health_checked_at", "")
-        )
+        changed = getattr(
+            self, "cookie_health_status", "unknown"
+        ) != status or not getattr(self, "cookie_health_checked_at", "")
         self.cookie_health_status = status
         self.cookie_health_checked_at = checked_at
         if changed and hasattr(self, "_data"):
             self._data["_cookie_health_status"] = status
             self._data["_cookie_health_checked_at"] = checked_at
+            self._data["_cookie_fingerprint"] = self._cookie_fingerprint(
+                self._get_cookie_value()
+            )
             self._save_data()
 
     async def run_monitor(self):
@@ -2571,6 +3122,13 @@ class WeiboMonitor(Star):
                 now = self._get_utc8_now()
                 current_time_str = now.strftime("%H:%M")
                 current_date_str = now.strftime("%Y%m%d")
+
+                try:
+                    await self._send_daily_configuration_reminder()
+                except Exception as reminder_error:
+                    self.plugin_logger.warning(
+                        f"WeiboMonitor: 发送配置缺口提醒失败: {reminder_error}"
+                    )
 
                 retention = self._get_config("temp_media_retention_minutes", 10)
                 if retention > 0:
@@ -2659,13 +3217,12 @@ class WeiboMonitor(Star):
                     >= actual_interval * 60
                 ):
                     urls = self._parse_urls(self._get_config("weibo_urls", []))
-                    targets = self.get_targets()
                     msg_format = self.message_format
-                    cookie = self._get_config("weibo_cookie", "")
+                    cookie = self._get_cookie_value()
 
                     if not cookie:
                         self.plugin_logger.warning(
-                            "WeiboMonitor: 未配置微博Cookie，跳过本轮检查。请尽快配置！"
+                            "WeiboMonitor: 未配置微博 Cookie，跳过本轮微博动态检查。"
                         )
                     elif not urls:
                         self.plugin_logger.debug("WeiboMonitor: 未配置监控URL")
@@ -2673,66 +3230,48 @@ class WeiboMonitor(Star):
                         self.plugin_logger.debug("WeiboMonitor: 未配置推送目标会话ID")
                     else:
                         # 检查 Cookie 健康
-                        is_cookie_healthy = await self._check_cookie_health()
-                        self._set_cookie_health_status(
-                            "valid" if is_cookie_healthy else "invalid"
-                        )
-                        if not is_cookie_healthy:
-                            if not self.cookie_invalid_notified:
-                                self.plugin_logger.warning(
-                                    "WeiboMonitor: 检测到 Cookie 已失效！已向用户发送通知。"
-                                )
-                                chain = MessageChain().message(
-                                    "⚠️ 微博监控助手提醒：检测到您的微博 Cookie 已失效，插件将无法正常抓取数据。请尽快在后台更新 Cookie 以恢复监控功能！"
-                                )
-
-                                # 获取通知目标：优先使用专门配置的通知目标，否则使用默认推送目标
-                                notification_target = self._get_config(
-                                    "cookie_notification_target", ""
-                                )
-                                if (
-                                    isinstance(notification_target, str)
-                                    and notification_target.strip()
-                                ):
-                                    notify_targets = [
-                                        t.strip()
-                                        for t in notification_target.split(",")
-                                        if t.strip()
-                                    ]
-                                elif (
-                                    isinstance(notification_target, list)
-                                    and notification_target
-                                ):
-                                    notify_targets = []
-                                    for item in notification_target:
-                                        item_str = str(item).strip()
-                                        if "," in item_str:
-                                            notify_targets.extend(
-                                                [
-                                                    t.strip()
-                                                    for t in item_str.split(",")
-                                                    if t.strip()
-                                                ]
-                                            )
-                                        elif item_str:
-                                            notify_targets.append(item_str)
-                                    if not notify_targets:
-                                        notify_targets = targets
-                                else:
-                                    notify_targets = list(
-                                        set(targets)
-                                        | self._get_all_subscribed_sessions()
+                        cookie_health_status = await self._check_cookie_health()
+                        self._set_cookie_health_status(cookie_health_status)
+                        if cookie_health_status != "valid":
+                            if cookie_health_status == "invalid":
+                                if not self.cookie_invalid_notified:
+                                    notify_targets = (
+                                        self._get_management_notification_targets(
+                                            fallback_to_subscriptions=True
+                                        )
                                     )
-
-                                for target in notify_targets:
-                                    try:
-                                        await self.context.send_message(target, chain)
-                                    except Exception:
-                                        pass
-                                self.cookie_invalid_notified = True
-                            self.plugin_logger.debug(
-                                "WeiboMonitor: Cookie 已失效，跳过本轮抓取。"
-                            )
+                                    (
+                                        successful,
+                                        failed,
+                                    ) = await self._send_text_to_targets(
+                                        notify_targets,
+                                        "⚠️ 微博监控 Cookie 失效提醒：已配置的微博 Cookie 验证为未登录或已失效，微博动态自动监控已暂停。\n请重新获取 Cookie，更新后使用 /weibo_verify 验证。",
+                                        reason="Cookie 失效通知",
+                                    )
+                                    if successful:
+                                        self.plugin_logger.warning(
+                                            f"WeiboMonitor: Cookie 已失效，已通知 {len(successful)}/{len(notify_targets)} 个目标"
+                                        )
+                                    elif notify_targets:
+                                        self.plugin_logger.warning(
+                                            "WeiboMonitor: Cookie 已失效，但通知未能发送到任何目标"
+                                        )
+                                    else:
+                                        self.plugin_logger.warning(
+                                            "WeiboMonitor: Cookie 已失效，但没有可用的管理通知目标"
+                                        )
+                                    if failed:
+                                        self.plugin_logger.warning(
+                                            f"WeiboMonitor: 有 {len(failed)} 个目标未收到 Cookie 失效通知"
+                                        )
+                                    self.cookie_invalid_notified = True
+                                self.plugin_logger.debug(
+                                    "WeiboMonitor: Cookie 已失效，跳过本轮抓取。"
+                                )
+                            else:
+                                self.plugin_logger.warning(
+                                    "WeiboMonitor: Cookie 暂时无法验证，跳过本轮抓取并等待下次重试。"
+                                )
                         else:
                             if self.cookie_invalid_notified:
                                 self.plugin_logger.info(
@@ -2781,8 +3320,7 @@ class WeiboMonitor(Star):
 
                     last_check_time = asyncio.get_event_loop().time()
                     self.next_push_time = (
-                        self._get_utc8_now()
-                        + timedelta(minutes=actual_interval)
+                        self._get_utc8_now() + timedelta(minutes=actual_interval)
                     ).strftime("%Y-%m-%d %H:%M:%S")
 
                 # 监控周期失败时按指数退避；成功后恢复默认 60 秒轮询。
@@ -2888,20 +3426,44 @@ class WeiboMonitor(Star):
         msg_format: str,
         fallback_target: str = None,
         skip_log: bool = False,
-    ):
+    ) -> Dict[str, Any]:
         """发送新微博到指定目标（文本与图片分别独立发送，兼容所有平台）"""
+        targets = list(dict.fromkeys(targets))
+        used_fallback = False
         if not targets and fallback_target:
             targets = [fallback_target]
+            used_fallback = True
 
         if not targets:
             self.plugin_logger.debug("WeiboMonitor: 没有配置推送目标，跳过推送")
-            return
+            return {
+                "used_fallback": False,
+                "attempted_targets": [],
+                "post_results": [],
+            }
 
+        post_results = []
         for post in new_posts:
-            await self._send_post_to_targets(post, msg_format, targets, skip_log)
-            self.plugin_logger.info(
-                f"WeiboMonitor: 已推送 {post.get('username')} 的更新到 {len(targets)} 个目标"
+            result = await self._send_post_to_targets(
+                post, msg_format, targets, skip_log
             )
+            post_results.append(result)
+            success_count = len(result["successful_text_targets"])
+            attempted_count = len(result["attempted_targets"])
+            if success_count == attempted_count:
+                self.plugin_logger.info(
+                    f"WeiboMonitor: 已向 {success_count}/{attempted_count} 个目标提交 {post.get('username')} 的正文"
+                )
+            else:
+                self.plugin_logger.warning(
+                    f"WeiboMonitor: {post.get('username')} 的正文仅成功提交到 {success_count}/{attempted_count} 个目标"
+                )
+
+        return {
+            "used_fallback": used_fallback,
+            "attempted_targets": targets,
+            "post_results": post_results,
+        }
 
     async def parse_uid(self, url: str) -> Optional[str]:
         """

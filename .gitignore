@@ -174,3 +174,4 @@ Thumbs.db
 *.tmp
 *.bak
 CODE_REVIEW_REPORT.md
+/tests
