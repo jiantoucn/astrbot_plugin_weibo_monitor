@@ -14,7 +14,7 @@
     "items": {
       "weibo_urls": {"type": "list", "item_type": "string", "default": [], "invisible": true},
       "weibo_cookie": {"type": "string", "default": "", "description": "微博 Cookie", "hint": "微博动态抓取必须配置。填写后还需在插件详情页的“订阅分组管理”中添加接收会话。", "obvious_hint": true},
-      "cookie_notification_target": {"type": "string", "default": "", "description": "管理与配置提醒目标", "hint": "可选，填写会话 ID；用于 Cookie 未配置、Cookie 失效或尚未配置订阅分组等管理提醒。未填写时，只有已有订阅会话的提醒可回退发送到这些会话。"}
+      "cookie_notification_target": {"type": "string", "default": "", "description": "管理与配置提醒目标", "hint": "可选。请在目标群聊或私聊执行 /weibo_umo，并填写命令返回的完整会话 ID；不要填写平台原始群号或用户号。用于 Cookie 未配置、Cookie 失效或尚未配置订阅分组等管理提醒。"}
     }
   },
   "schedule_settings": {

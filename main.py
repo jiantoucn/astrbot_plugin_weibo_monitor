@@ -33,6 +33,14 @@ DEFAULT_HOTSEARCH_INTERVAL = 60
 DEFAULT_HOTSEARCH_TOP_N = 10
 DEFAULT_HOTSEARCH_TEMPLATE = "🔥 微博热搜榜 Top {top_n}\n⏰ 更新时间: {time}\n\n{items}"
 PLUGIN_NAME = "astrbot_plugin_weibo_monitor"
+TARGET_ID_FAILURE_GUIDANCE = (
+    "💡 请到未收到消息的目标群聊或私聊中执行 /weibo_umo，核对命令返回的完整会话 ID；"
+    "不要填写平台原始群号或用户号。若 ID 一致，请检查机器人主动发消息权限和适配器日志。"
+)
+CURRENT_SESSION_FAILURE_GUIDANCE = (
+    "💡 当前会话 ID 来自本次命令，无需重新配置；请检查机器人主动发消息权限、"
+    "消息平台连接和适配器日志。"
+)
 
 CONFIG_GROUPS = {
     "account_settings": ("weibo_urls", "weibo_cookie", "cookie_notification_target"),
@@ -78,7 +86,7 @@ CONFIG_KEY_GROUPS = {
     "astrbot_plugin_weibo_monitor",
     "Sayaka",
     "定时监控微博用户动态并推送到指定会话，支持按会话分组订阅不同博主。",
-    "v1.19.8",
+    "v1.19.9",
     "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor",
 )
 class WeiboMonitor(Star):
@@ -909,7 +917,7 @@ class WeiboMonitor(Star):
                 {
                     "code": "no_sessions",
                     "message": "尚未配置有效的接收会话。",
-                    "action": "打开插件详情页的“订阅分组管理”，添加会话并保存。",
+                    "action": "先在希望接收消息的群聊或私聊执行 /weibo_umo 获取会话 ID，再到“订阅分组管理”添加并保存。",
                 }
             )
         elif (
@@ -1010,7 +1018,9 @@ class WeiboMonitor(Star):
                 successful.append(target)
             except Exception as e:
                 failed.append(target)
-                self.plugin_logger.warning(f"{reason}发送到 {target} 失败: {e}")
+                self.plugin_logger.warning(
+                    f"{reason}发送到 {target} 失败: {e}。{TARGET_ID_FAILURE_GUIDANCE}"
+                )
         return successful, failed
 
     async def _send_daily_configuration_reminder(self):
@@ -1034,7 +1044,8 @@ class WeiboMonitor(Star):
             content = (
                 "⚠️ 微博监控配置提醒：Cookie 已配置，但尚未配置订阅分组，"
                 "自动检查的微博动态将没有接收会话。\n"
-                "请打开本插件详情页的“订阅分组管理”，添加会话并保存。"
+                "请先在希望接收微博的群聊或私聊执行 /weibo_umo 获取会话 ID，"
+                "再打开本插件详情页的“订阅分组管理”添加并保存。"
             )
         else:
             return
@@ -1213,6 +1224,11 @@ class WeiboMonitor(Star):
             if not session_id:
                 return error_response(
                     f"第 {index} 行的会话 ID 不能为空", status_code=400
+                )
+            if re.search(r":\s*\*\s*$", session_id):
+                return error_response(
+                    f"第 {index} 行似乎粘贴了“会话 ID: *”。这里只填写 /weibo_umo 返回的完整会话 ID；“全部微博博主”请使用旁边的接收范围选择。",
+                    status_code=400,
                 )
             if session_id in seen_sessions:
                 return error_response(f"会话 ID 重复：{session_id}", status_code=400)
@@ -1510,9 +1526,13 @@ class WeiboMonitor(Star):
         chain = MessageChain().message(summary_msg)
         for target in targets:
             try:
-                await self.context.send_message(target, chain)
+                result = await self.context.send_message(target, chain)
+                if result is False:
+                    raise RuntimeError("AstrBot 未找到匹配的消息平台")
             except Exception as e:
-                self.plugin_logger.error(f"发送每日总结到 {target} 失败: {e}")
+                self.plugin_logger.error(
+                    f"发送每日总结到 {target} 失败: {e}。{TARGET_ID_FAILURE_GUIDANCE}"
+                )
 
     async def _fetch_hotsearch(self) -> List[dict]:
         """获取微博热搜榜数据，返回热搜条目列表"""
@@ -1619,11 +1639,20 @@ class WeiboMonitor(Star):
             self.plugin_logger.error(f"获取热搜数据出错: {e}")
             return []
 
-    async def _push_hotsearch(self, items: List[dict], targets: List[str]):
+    async def _push_hotsearch(
+        self,
+        items: List[dict],
+        targets: List[str],
+        failure_guidance: str = TARGET_ID_FAILURE_GUIDANCE,
+    ) -> Dict[str, Any]:
         """推送热搜榜到目标会话"""
         if not items:
             self.plugin_logger.debug("热搜条目为空，跳过推送")
-            return
+            return {
+                "successful_count": 0,
+                "attempted_count": len(targets),
+                "failed_targets": [],
+            }
 
         top_n = self._get_config("hotsearch_top_n", DEFAULT_HOTSEARCH_TOP_N)
         display_items = items[:top_n]
@@ -1653,12 +1682,18 @@ class WeiboMonitor(Star):
 
         chain = MessageChain().message(content)
         sent_count = 0
+        failed_targets = []
         for target in targets:
             try:
-                await self.context.send_message(target, chain)
+                result = await self.context.send_message(target, chain)
+                if result is False:
+                    raise RuntimeError("AstrBot 未找到匹配的消息平台")
                 sent_count += 1
             except Exception as e:
-                self.plugin_logger.error(f"推送热搜到 {target} 失败: {e}")
+                failed_targets.append(target)
+                self.plugin_logger.error(
+                    f"推送热搜到 {target} 失败: {e}。{failure_guidance}"
+                )
 
         if sent_count > 0:
             self.plugin_logger.info(
@@ -1667,6 +1702,11 @@ class WeiboMonitor(Star):
             self._log_hotsearch_to_daily(display_items)
             self._data["last_hotsearch_push_time"] = now.strftime("%Y-%m-%d %H:%M:%S")
             self._save_data()
+        return {
+            "successful_count": sent_count,
+            "attempted_count": len(targets),
+            "failed_targets": failed_targets,
+        }
 
     def _load_data(self) -> dict:
         """从文件加载持久化数据，损坏时自动备份"""
@@ -2034,7 +2074,12 @@ class WeiboMonitor(Star):
         return await self._download_video(video_url, save_name)
 
     async def _send_post_to_targets(
-        self, post: dict, msg_format: str, targets: List[str], skip_log: bool = False
+        self,
+        post: dict,
+        msg_format: str,
+        targets: List[str],
+        skip_log: bool = False,
+        failure_guidance: str = TARGET_ID_FAILURE_GUIDANCE,
     ) -> Dict[str, Any]:
         """发送单条微博到指定目标。
         文字与图片分别独立发送，解决飞书适配器图文混合消息文字丢失问题（统一应用于所有平台）。
@@ -2081,7 +2126,9 @@ class WeiboMonitor(Star):
                 successful_text_targets.append(target)
             except Exception as e:
                 failed_text_targets.append(target)
-                self.plugin_logger.error(f"WeiboMonitor: 正文推送到 {target} 失败: {e}")
+                self.plugin_logger.error(
+                    f"WeiboMonitor: 正文推送到 {target} 失败: {e}。{failure_guidance}"
+                )
                 continue
 
             if img_chain is not None:
@@ -2352,12 +2399,12 @@ class WeiboMonitor(Star):
         """获取当前会话 ID，并给出配置示例"""
         sid = event.unified_msg_origin
         yield event.plain_result(
-            f"📌 当前会话 ID: {sid}\n\n"
-            f"请在 WebUI 的本插件详情页打开“订阅分组管理”页面后添加：\n\n"
-            f"  接收所有已监控博主的微博:\n"
-            f"    {sid}: *\n\n"
-            f"  只接收指定博主：在页面的勾选列表中选择已监控账号。\n\n"
-            f"热搜和每日总结可在同一行的勾选框中独立开启。博主 UID 从微博主页链接中获取，如 https://weibo.com/u/1234567890 → UID 是 1234567890"
+            f"📌 当前会话 ID（请只复制下一行）：\n{sid}\n\n"
+            "请务必在实际接收推送的目标群聊或私聊中执行本命令，不同会话的 ID 不同。\n\n"
+            "请在本插件详情页的“订阅分组管理”中：\n"
+            "1. 将上面的完整 ID 原样粘贴到“会话 ID”；\n"
+            "2. 在“微博接收范围”选择“全部微博博主”或“仅指定博主”。\n\n"
+            "不要在 ID 后添加“: *”或微博 UID，页面会根据选择自动保存接收范围。"
         )
 
     @filter.command("weibo_export")
@@ -2555,8 +2602,9 @@ class WeiboMonitor(Star):
                     next_step = ""
                     if not self._get_all_subscribed_sessions():
                         next_step = (
-                            "\n⚠️ 还需打开本插件详情页的“订阅分组管理”，"
-                            "添加接收会话并保存，否则自动检查的微博动态无人接收。"
+                            "\n⚠️ 还需在希望接收微博的群聊或私聊执行 /weibo_umo 获取会话 ID，"
+                            "再打开本插件详情页的“订阅分组管理”添加并保存，"
+                            "否则自动检查的微博动态无人接收。"
                         )
                     yield event.plain_result(
                         f"✅ Cookie 更换成功！{user_info}\n{save_msg}\n"
@@ -2627,20 +2675,35 @@ class WeiboMonitor(Star):
         media_note = (
             " 图片或视频部分发送失败。" if result.get("media_partial_failure") else ""
         )
+        failed_targets = result.get("failed_text_targets", [])
+        configured_failed_targets = [
+            target for target in failed_targets if target != current_target
+        ]
+        target_hints = []
+        if configured_failed_targets:
+            target_hints.append(TARGET_ID_FAILURE_GUIDANCE)
+        if current_target in failed_targets:
+            target_hints.append(CURRENT_SESSION_FAILURE_GUIDANCE)
+        target_hint = f"\n{' '.join(target_hints)}" if target_hints else ""
 
         if delivery.get("used_fallback"):
             if success_count:
                 if not has_any_sessions:
                     return (
                         f"✅ {username}：本次仅测试发送到当前会话；"
-                        f"自动推送分组尚未配置。{media_note}"
+                        f"自动推送分组尚未配置。{media_note}\n"
+                        "如需自动推送，请在目标群聊或私聊执行 /weibo_umo 获取会话 ID，"
+                        "再到订阅分组页面添加。"
                     )
                 if not has_uid_targets:
                     return (
                         f"⚠️ {username}：现有分组没有接收该博主，"
                         f"本次仅测试发送到当前会话；自动监控不会推送该博主。{media_note}"
                     )
-            return f"❌ {username}：已获取最新动态，但正文发送到当前会话失败。"
+            return (
+                f"❌ {username}：已获取最新动态，但正文发送到当前会话失败。"
+                f"\n{CURRENT_SESSION_FAILURE_GUIDANCE}"
+            )
 
         if success_count == attempted_count:
             prefix = "✅"
@@ -2662,7 +2725,10 @@ class WeiboMonitor(Star):
             current_note = "当前会话投递失败。"
         else:
             current_note = "当前会话不在该博主的接收范围。"
-        return f"{prefix} {username}：{delivery_text}；{current_note}{media_note}"
+        return (
+            f"{prefix} {username}：{delivery_text}；{current_note}{media_note}"
+            f"{target_hint}"
+        )
 
     @filter.command("weibo_check")
     async def weibo_check(self, event: AstrMessageEvent):
@@ -2792,16 +2858,48 @@ class WeiboMonitor(Star):
             yield event.plain_result("❌ 热搜监控功能未开启，请先在插件设置中启用。")
             return
 
-        targets = self.get_delivery_targets("hotsearch")
-        if not targets:
+        configured_targets = self.get_delivery_targets("hotsearch")
+        targets = configured_targets
+        if not configured_targets:
             targets = [event.unified_msg_origin]
 
         yield event.plain_result("🔥 正在获取微博热搜榜...")
         try:
             hot_items = await self._fetch_hotsearch()
             if hot_items:
-                await self._push_hotsearch(hot_items, targets)
-                yield event.plain_result("✅ 热搜榜已发送。")
+                delivery = await self._push_hotsearch(
+                    hot_items,
+                    targets,
+                    TARGET_ID_FAILURE_GUIDANCE
+                    if configured_targets
+                    else CURRENT_SESSION_FAILURE_GUIDANCE,
+                )
+                success_count = delivery["successful_count"]
+                attempted_count = delivery["attempted_count"]
+                if success_count == attempted_count:
+                    yield event.plain_result(
+                        f"✅ 热搜榜已发送到 {success_count}/{attempted_count} 个目标。"
+                    )
+                elif success_count:
+                    guidance = (
+                        TARGET_ID_FAILURE_GUIDANCE
+                        if configured_targets
+                        else CURRENT_SESSION_FAILURE_GUIDANCE
+                    )
+                    yield event.plain_result(
+                        f"⚠️ 热搜榜仅发送到 {success_count}/{attempted_count} 个目标。\n"
+                        f"{guidance}"
+                    )
+                else:
+                    guidance = (
+                        TARGET_ID_FAILURE_GUIDANCE
+                        if configured_targets
+                        else CURRENT_SESSION_FAILURE_GUIDANCE
+                    )
+                    yield event.plain_result(
+                        f"❌ 热搜榜未能发送到任何目标（0/{attempted_count}）。\n"
+                        f"{guidance}"
+                    )
             else:
                 yield event.plain_result("❌ 未获取到热搜数据，请稍后重试。")
         except Exception as e:
@@ -2900,7 +2998,10 @@ class WeiboMonitor(Star):
 
         targets = self.get_delivery_targets("daily_summary")
         if not targets:
-            yield event.plain_result("❌ 未配置推送目标，无法发送每日总结。")
+            yield event.plain_result(
+                "❌ 未配置每日总结接收会话。请在目标群聊或私聊执行 /weibo_umo "
+                "获取会话 ID，再到订阅分组页面添加会话并勾选“每日总结”。"
+            )
             return
 
         yield event.plain_result("📊 正在生成昨日总结...")
@@ -2960,17 +3061,28 @@ class WeiboMonitor(Star):
         success_count = 0
         for target in targets:
             try:
-                await self.context.send_message(target, chain)
+                result = await self.context.send_message(target, chain)
+                if result is False:
+                    raise RuntimeError("AstrBot 未找到匹配的消息平台")
                 success_count += 1
             except Exception as e:
-                self.plugin_logger.error(f"发送每日总结到 {target} 失败: {e}")
+                self.plugin_logger.error(
+                    f"发送每日总结到 {target} 失败: {e}。{TARGET_ID_FAILURE_GUIDANCE}"
+                )
 
-        if success_count > 0:
+        if success_count == len(targets):
             yield event.plain_result(
                 f"✅ 已向 {success_count}/{len(targets)} 个目标发送昨日总结。"
             )
+        elif success_count:
+            yield event.plain_result(
+                f"⚠️ 仅向 {success_count}/{len(targets)} 个目标发送昨日总结。\n"
+                f"{TARGET_ID_FAILURE_GUIDANCE}"
+            )
         else:
-            yield event.plain_result("❌ 发送失败，所有目标均未发送成功。")
+            yield event.plain_result(
+                f"❌ 发送失败，所有目标均未发送成功。\n{TARGET_ID_FAILURE_GUIDANCE}"
+            )
 
     @filter.command("weibo_get")
     async def weibo_get(self, event: AstrMessageEvent, url: str = ""):
@@ -3020,13 +3132,22 @@ class WeiboMonitor(Star):
             yield event.plain_result("❌ 该微博内容为空。")
             return
 
-        targets = self.get_targets()
-        if not targets:
+        configured_targets = self.get_targets()
+        targets = configured_targets
+        if not configured_targets:
             targets = [event.unified_msg_origin]
 
         msg_format = self.message_format
         delivery = await self._send_post_to_targets(
-            post, msg_format, targets, skip_log=True
+            post,
+            msg_format,
+            targets,
+            skip_log=True,
+            failure_guidance=(
+                TARGET_ID_FAILURE_GUIDANCE
+                if configured_targets
+                else CURRENT_SESSION_FAILURE_GUIDANCE
+            ),
         )
 
         actual_images = delivery["image_count"]
@@ -3054,8 +3175,14 @@ class WeiboMonitor(Star):
         media_note = (
             "，图片或视频部分发送失败" if delivery["media_partial_failure"] else ""
         )
+        target_hint = (
+            f"\n{TARGET_ID_FAILURE_GUIDANCE if configured_targets else CURRENT_SESSION_FAILURE_GUIDANCE}"
+            if delivery["failed_text_targets"]
+            else ""
+        )
         yield event.plain_result(
             f"{prefix} {post.get('username')} 的微博{delivery_text}{image_info}{video_info_text}{media_note}。"
+            f"{target_hint}"
         )
 
     @property
@@ -3445,7 +3572,15 @@ class WeiboMonitor(Star):
         post_results = []
         for post in new_posts:
             result = await self._send_post_to_targets(
-                post, msg_format, targets, skip_log
+                post,
+                msg_format,
+                targets,
+                skip_log,
+                failure_guidance=(
+                    CURRENT_SESSION_FAILURE_GUIDANCE
+                    if used_fallback
+                    else TARGET_ID_FAILURE_GUIDANCE
+                ),
             )
             post_results.append(result)
             success_count = len(result["successful_text_targets"])

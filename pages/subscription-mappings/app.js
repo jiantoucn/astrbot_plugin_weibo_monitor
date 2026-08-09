@@ -327,10 +327,16 @@ saveButton.addEventListener("click", async () => {
   if (invalidRows.length && !window.confirm("存在需要修复的旧配置。继续保存会移除这些旧记录；确定已不再需要它们吗？")) {
     return;
   }
+  const rows = readRows();
+  const mappedRowIndex = rows.findIndex((row) => /:\s*\*\s*$/.test(row.session_id));
+  if (mappedRowIndex >= 0) {
+    setStatus(`第 ${mappedRowIndex + 1} 行似乎粘贴了“会话 ID: *”。这里只填写 /weibo_umo 返回的完整会话 ID；接收范围请使用旁边的选择框。`, "error");
+    return;
+  }
   saveButton.disabled = true;
   setStatus("正在保存…");
   try {
-    const result = await bridge.apiPost("subscription-mappings", { rows: readRows(), monitor_urls: monitorUrls });
+    const result = await bridge.apiPost("subscription-mappings", { rows, monitor_urls: monitorUrls });
     const readiness = result.runtime_status && result.runtime_status.weibo_readiness;
     if (result.runtime_status) renderRuntimeStatus(result.runtime_status);
     if (readiness && readiness.state !== "ready") {
