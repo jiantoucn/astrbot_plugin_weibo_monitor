@@ -52,6 +52,14 @@
       "temp_media_retention_minutes": {"type": "int", "default": 10, "description": "临时媒体保留时长（分钟）", "hint": "0 表示不清理。"}
     }
   },
+  "delivery_settings": {
+    "type": "object",
+    "description": "消息投递",
+    "hint": "防止单个消息平台或适配器长时间无响应时卡住整个插件。",
+    "items": {
+      "message_send_timeout": {"type": "int", "default": 60, "description": "普通消息发送超时（秒）", "hint": "适用于文字、图片、热搜、总结和配置提醒；0 表示不限制。视频仍使用独立的视频发送超时。"}
+    }
+  },
   "filter_settings": {
     "type": "object",
     "description": "内容过滤",
@@ -102,6 +110,7 @@
   "video_download_timeout": {"type": "int", "default": 60, "invisible": true},
   "video_send_timeout": {"type": "int", "default": 60, "invisible": true},
   "temp_media_retention_minutes": {"type": "int", "default": 10, "invisible": true},
+  "message_send_timeout": {"type": "int", "default": 60, "invisible": true},
   "filter_keywords": {"type": "list", "item_type": "string", "default": [], "invisible": true},
   "whitelist_keywords": {"type": "list", "item_type": "string", "default": [], "invisible": true},
   "send_original": {"type": "bool", "default": true, "invisible": true},

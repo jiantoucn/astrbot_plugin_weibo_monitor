@@ -8,6 +8,7 @@ import hashlib
 import inspect
 import random
 import logging
+import copy
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Tuple, Dict, Any
@@ -24,6 +25,7 @@ DEFAULT_REQUEST_INTERVAL = 5  # 默认请求间隔（秒）
 DEFAULT_TIMEOUT = 20  # 默认HTTP请求超时（秒）
 MAX_CONCURRENT_REQUESTS = 5  # 最大并发请求数
 MAX_PUSH_QUEUE_SIZE = 100  # 推送队列最大积压条目数
+DEFAULT_MESSAGE_SEND_TIMEOUT = 60  # 普通主动消息发送超时（秒）
 DEFAULT_MESSAGE_TEMPLATE = "🔔 {name} 发微博啦！\n\n{weibo}\n\n链接: {link}"
 WEIBO_API_BASE = "https://m.weibo.cn/api/container/getIndex"
 WEIBO_MOBILE_BASE = "https://m.weibo.cn"
@@ -60,6 +62,7 @@ CONFIG_GROUPS = {
         "video_send_timeout",
         "temp_media_retention_minutes",
     ),
+    "delivery_settings": ("message_send_timeout",),
     "filter_settings": ("filter_keywords", "whitelist_keywords"),
     "logging_settings": (
         "enable_plugin_log",
@@ -86,7 +89,7 @@ CONFIG_KEY_GROUPS = {
     "astrbot_plugin_weibo_monitor",
     "Sayaka",
     "定时监控微博用户动态并推送到指定会话，支持按会话分组订阅不同博主。",
-    "v1.19.9",
+    "v1.19.10",
     "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor",
 )
 class WeiboMonitor(Star):
@@ -98,6 +101,8 @@ class WeiboMonitor(Star):
         self._migrate_persist_task: Optional[asyncio.Task] = None
         self.cookie_invalid_notified = False  # cookie 失效是否已通知
         self.push_queue: asyncio.Queue = asyncio.Queue(maxsize=MAX_PUSH_QUEUE_SIZE)
+        self._queued_delivery_ids: set[str] = set()
+        self._pending_cursor_updates: Dict[str, Tuple[str, str]] = {}
 
         # 确保数据目录存在
         self.data_dir = StarTools.get_data_dir()
@@ -155,6 +160,8 @@ class WeiboMonitor(Star):
                 self.plugin_logger.error(f"WeiboMonitor: 迁移数据失败: {e}")
 
         self._data = self._load_data()
+        if not isinstance(self._data.get("_pending_deliveries"), dict):
+            self._data["_pending_deliveries"] = {}
 
         # 订阅分组由 Plugin Page 管理。AstrBot 升级时若框架配置被默认值覆盖，
         # 从持久化快照恢复，避免用户重新配置全部会话和博主。
@@ -205,6 +212,7 @@ class WeiboMonitor(Star):
         # 启动后台监控任务
         self.monitor_task = asyncio.create_task(self.run_monitor())
         self.push_consumer_task = asyncio.create_task(self._push_consumer())
+        self._enqueue_pending_deliveries()
 
     def setup_logging(self):
         """设置运行日志"""
@@ -1012,9 +1020,7 @@ class WeiboMonitor(Star):
         chain = MessageChain().message(content)
         for target in dict.fromkeys(targets):
             try:
-                result = await self.context.send_message(target, chain)
-                if result is False:
-                    raise RuntimeError("AstrBot 未找到匹配的消息平台")
+                await self._send_message_with_timeout(target, chain)
                 successful.append(target)
             except Exception as e:
                 failed.append(target)
@@ -1022,6 +1028,39 @@ class WeiboMonitor(Star):
                     f"{reason}发送到 {target} 失败: {e}。{TARGET_ID_FAILURE_GUIDANCE}"
                 )
         return successful, failed
+
+    def _get_message_send_timeout(self) -> int:
+        """返回普通主动消息超时；0 表示用户显式选择不限制。"""
+        value = self._get_config("message_send_timeout", DEFAULT_MESSAGE_SEND_TIMEOUT)
+        try:
+            timeout = int(value)
+        except (TypeError, ValueError):
+            timeout = DEFAULT_MESSAGE_SEND_TIMEOUT
+        if timeout < 0:
+            timeout = DEFAULT_MESSAGE_SEND_TIMEOUT
+        return timeout
+
+    async def _send_message_with_timeout(
+        self, target: str, chain: MessageChain, *, timeout: Optional[int] = None
+    ):
+        """逐目标发送消息，防止单个适配器永久卡住后台任务。"""
+        send_timeout = self._get_message_send_timeout() if timeout is None else timeout
+        try:
+            if send_timeout > 0:
+                result = await asyncio.wait_for(
+                    self.context.send_message(target, chain), timeout=send_timeout
+                )
+            else:
+                result = await self.context.send_message(target, chain)
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError as error:
+            raise TimeoutError(
+                f"发送超过 {send_timeout} 秒，平台是否已接收未知"
+            ) from error
+        if result is False:
+            raise RuntimeError("AstrBot 未找到匹配的消息平台")
+        return result
 
     async def _send_daily_configuration_reminder(self):
         """发送配置缺口提醒；每个目标每天至多尝试一次。"""
@@ -1526,9 +1565,7 @@ class WeiboMonitor(Star):
         chain = MessageChain().message(summary_msg)
         for target in targets:
             try:
-                result = await self.context.send_message(target, chain)
-                if result is False:
-                    raise RuntimeError("AstrBot 未找到匹配的消息平台")
+                await self._send_message_with_timeout(target, chain)
             except Exception as e:
                 self.plugin_logger.error(
                     f"发送每日总结到 {target} 失败: {e}。{TARGET_ID_FAILURE_GUIDANCE}"
@@ -1556,84 +1593,78 @@ class WeiboMonitor(Star):
                 async with self._request_semaphore:
                     resp = await self.client.get(HOTSEARCH_API_URL, headers=headers)
 
-                need_cookie_fallback = False
-                data = {}
-                if resp.status_code != 200:
-                    self.plugin_logger.warning(
-                        f"无Cookie获取热搜失败，状态码: {resp.status_code}"
-                    )
-                    need_cookie_fallback = True
-                else:
-                    try:
-                        data = resp.json()
-                        if data.get("ok") != 1:
-                            self.plugin_logger.warning("无Cookie热搜接口返回数据异常")
-                            need_cookie_fallback = True
-                    except Exception as e:
-                        self.plugin_logger.warning(f"无Cookie热搜接口解析JSON失败: {e}")
+            need_cookie_fallback = False
+            data = {}
+            if resp.status_code != 200:
+                self.plugin_logger.warning(
+                    f"无Cookie获取热搜失败，状态码: {resp.status_code}"
+                )
+                need_cookie_fallback = True
+            else:
+                try:
+                    data = resp.json()
+                    if data.get("ok") != 1:
+                        self.plugin_logger.warning("无Cookie热搜接口返回数据异常")
                         need_cookie_fallback = True
+                except (AttributeError, TypeError, ValueError) as error:
+                    self.plugin_logger.warning(f"无Cookie热搜接口解析JSON失败: {error}")
+                    need_cookie_fallback = True
 
-                # 如果无 Cookie 获取失败，且配置了 Cookie，则尝试带 Cookie 获取
-                if need_cookie_fallback:
-                    cookie = self._get_config("weibo_cookie", "")
-                    if not cookie:
-                        self.plugin_logger.error(
-                            "无Cookie获取失败，且未配置 weibo_cookie，无法兜底"
-                        )
-                        return []
-
-                    self.plugin_logger.info("尝试携带 Cookie 获取热搜数据兜底...")
-                    headers["Cookie"] = cookie
-                    resp = await self.client.get(HOTSEARCH_API_URL, headers=headers)
-
-                    if resp.status_code != 200:
-                        self.plugin_logger.error(
-                            f"带Cookie获取热搜数据失败，状态码: {resp.status_code}"
-                        )
-                        return []
-
-                    try:
-                        data = resp.json()
-                        if data.get("ok") != 1:
-                            self.plugin_logger.error("带Cookie热搜接口返回数据状态异常")
-                            return []
-                    except Exception as e:
-                        self.plugin_logger.error(f"带Cookie热搜接口解析JSON失败: {e}")
-                        return []
-
-                realtime = data.get("data", {}).get("realtime", [])
-                if not realtime:
+            if need_cookie_fallback:
+                cookie = self._get_cookie_value()
+                if not cookie:
+                    self.plugin_logger.error(
+                        "无Cookie获取失败，且未配置 weibo_cookie，无法兜底"
+                    )
                     return []
 
-                filter_ads = self._get_config("hotsearch_filter_ads", True)
-                items = []
-                for item in realtime:
-                    if not isinstance(item, dict):
-                        continue
-                    if filter_ads and (
-                        item.get("is_ad") == 1 or item.get("is_ad_pos") == 1
-                    ):
-                        self.plugin_logger.debug(
-                            f"已过滤广告位热搜: {item.get('word', '')}"
-                        )
-                        continue
-
-                    word = item.get("word") or item.get("note")
-                    if not word:
-                        continue
-
-                    heat = str(item.get("num", ""))
-
-                    items.append(
-                        {
-                            "desc": str(word),
-                            "heat": heat,
-                            "scheme": f"https://s.weibo.com/weibo?q={quote(word)}",
-                        }
+                self.plugin_logger.info("尝试携带 Cookie 获取热搜数据兜底...")
+                headers["Cookie"] = cookie
+                async with self._request_semaphore:
+                    resp = await self.client.get(HOTSEARCH_API_URL, headers=headers)
+                if resp.status_code != 200:
+                    self.plugin_logger.error(
+                        f"带Cookie获取热搜数据失败，状态码: {resp.status_code}"
                     )
+                    return []
+                try:
+                    data = resp.json()
+                    if data.get("ok") != 1:
+                        self.plugin_logger.error("带Cookie热搜接口返回数据状态异常")
+                        return []
+                except (AttributeError, TypeError, ValueError) as error:
+                    self.plugin_logger.error(f"带Cookie热搜接口解析JSON失败: {error}")
+                    return []
 
-                self.plugin_logger.info(f"成功获取 {len(items)} 条热搜数据")
-                return items
+            realtime = data.get("data", {}).get("realtime", [])
+            if not realtime:
+                return []
+
+            filter_ads = self._get_config("hotsearch_filter_ads", True)
+            items = []
+            for item in realtime:
+                if not isinstance(item, dict):
+                    continue
+                if filter_ads and (
+                    item.get("is_ad") == 1 or item.get("is_ad_pos") == 1
+                ):
+                    self.plugin_logger.debug(
+                        f"已过滤广告位热搜: {item.get('word', '')}"
+                    )
+                    continue
+                word = item.get("word") or item.get("note")
+                if not word:
+                    continue
+                items.append(
+                    {
+                        "desc": str(word),
+                        "heat": str(item.get("num", "")),
+                        "scheme": f"https://s.weibo.com/weibo?q={quote(word)}",
+                    }
+                )
+
+            self.plugin_logger.info(f"成功获取 {len(items)} 条热搜数据")
+            return items
 
         except Exception as e:
             self.plugin_logger.error(f"获取热搜数据出错: {e}")
@@ -1685,9 +1716,7 @@ class WeiboMonitor(Star):
         failed_targets = []
         for target in targets:
             try:
-                result = await self.context.send_message(target, chain)
-                if result is False:
-                    raise RuntimeError("AstrBot 未找到匹配的消息平台")
+                await self._send_message_with_timeout(target, chain)
                 sent_count += 1
             except Exception as e:
                 failed_targets.append(target)
@@ -2120,9 +2149,7 @@ class WeiboMonitor(Star):
         image_failed_targets = []
         for target in attempted_targets:
             try:
-                result = await self.context.send_message(target, text_chain)
-                if result is False:
-                    raise RuntimeError("AstrBot 未找到匹配的消息平台")
+                await self._send_message_with_timeout(target, text_chain)
                 successful_text_targets.append(target)
             except Exception as e:
                 failed_text_targets.append(target)
@@ -2133,9 +2160,7 @@ class WeiboMonitor(Star):
 
             if img_chain is not None:
                 try:
-                    result = await self.context.send_message(target, img_chain)
-                    if result is False:
-                        raise RuntimeError("AstrBot 未找到匹配的消息平台")
+                    await self._send_message_with_timeout(target, img_chain)
                     successful_image_targets.append(target)
                 except Exception as e:
                     image_failed_targets.append(target)
@@ -3061,9 +3086,7 @@ class WeiboMonitor(Star):
         success_count = 0
         for target in targets:
             try:
-                result = await self.context.send_message(target, chain)
-                if result is False:
-                    raise RuntimeError("AstrBot 未找到匹配的消息平台")
+                await self._send_message_with_timeout(target, chain)
                 success_count += 1
             except Exception as e:
                 self.plugin_logger.error(
@@ -3246,6 +3269,7 @@ class WeiboMonitor(Star):
 
         while self.running:
             try:
+                self._enqueue_pending_deliveries()
                 now = self._get_utc8_now()
                 current_time_str = now.strftime("%H:%M")
                 current_date_str = now.strftime("%Y%m%d")
@@ -3487,6 +3511,96 @@ class WeiboMonitor(Star):
                     urls.append(item_str)
         return urls
 
+    def _persist_discovered_posts(
+        self,
+        uid: str,
+        posts: List[Dict[str, Any]],
+        targets: List[str],
+        msg_format: str,
+        cursor_update: Optional[Tuple[str, str]],
+    ) -> List[str]:
+        """将待投递微博与发现游标一次性落盘，再交给内存队列。"""
+        previous_data = copy.deepcopy(self._data)
+        pending = self._data.setdefault("_pending_deliveries", {})
+        if not isinstance(pending, dict):
+            pending = {}
+            self._data["_pending_deliveries"] = pending
+
+        delivery_ids = []
+        unique_targets = list(dict.fromkeys(targets))
+        for post in posts:
+            post_id = str(post.get("_post_id", "")).strip()
+            if not post_id or not unique_targets:
+                continue
+            delivery_id = f"{uid}:{post_id}"
+            if delivery_id not in pending:
+                pending[delivery_id] = {
+                    "uid": uid,
+                    "post_id": post_id,
+                    "post": copy.deepcopy(post),
+                    "message_format": msg_format,
+                    "pending_targets": list(unique_targets),
+                    "delivered_targets": [],
+                    "created_at": self._get_utc8_now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "attempts": 0,
+                    "next_retry_at": "",
+                    "last_error": "",
+                    "log_written": False,
+                }
+            delivery_ids.append(delivery_id)
+
+        if cursor_update:
+            cursor_key, cursor_value = cursor_update
+            self._data[cursor_key] = cursor_value
+
+        if self._data == previous_data:
+            return delivery_ids
+        if not self._save_data():
+            self._data = previous_data
+            self.plugin_logger.error(
+                f"WeiboMonitor: UID {uid} 的待投递微博未能落盘，本轮不推进游标"
+            )
+            return []
+        return delivery_ids
+
+    def _queue_pending_delivery(self, delivery_id: str) -> bool:
+        """将已落盘的投递项放入内存队列；队列满时等待后续补入。"""
+        if delivery_id in self._queued_delivery_ids:
+            return True
+        try:
+            self.push_queue.put_nowait(delivery_id)
+        except asyncio.QueueFull:
+            self.plugin_logger.warning(
+                f"[推送队列] 队列已满，待投递项 {delivery_id} 已落盘，稍后重试入队"
+            )
+            return False
+        self._queued_delivery_ids.add(delivery_id)
+        return True
+
+    def _enqueue_pending_deliveries(self):
+        """扫描持久化 outbox，恢复重启或队列满时未入队的投递项。"""
+        pending = self._data.get("_pending_deliveries", {})
+        if not isinstance(pending, dict):
+            return
+        candidates = []
+        for delivery_id, item in pending.items():
+            if not isinstance(item, dict) or not item.get("pending_targets"):
+                continue
+            next_retry_at = str(item.get("next_retry_at", "")).strip()
+            if next_retry_at:
+                try:
+                    retry_time = datetime.strptime(
+                        next_retry_at, "%Y-%m-%d %H:%M:%S"
+                    ).replace(tzinfo=timezone(timedelta(hours=8)))
+                    if retry_time > self._get_utc8_now():
+                        continue
+                except ValueError:
+                    pass
+            candidates.append((int(item.get("attempts", 0)), delivery_id))
+        for _, delivery_id in sorted(candidates):
+            if not self._queue_pending_delivery(delivery_id):
+                return
+
     async def _process_monitor_cycle(
         self, urls: List[str], base_req_interval: int, req_jitter: int, msg_format: str
     ):
@@ -3509,19 +3623,23 @@ class WeiboMonitor(Star):
                     )
                     continue
 
-                new_posts = await self.check_weibo(uid)
-                if new_posts:
-                    uid_targets = self._get_targets_for_uid(uid)
-                    if uid_targets:
-                        for post in new_posts:
-                            await self.push_queue.put((post, uid_targets, msg_format))
-                        self.plugin_logger.info(
-                            f"WeiboMonitor: UID {uid} 发现 {len(new_posts)} 条新微博，已加入推送队列"
-                        )
-                    else:
-                        self.plugin_logger.debug(
-                            f"WeiboMonitor: UID {uid} 没有可推送的目标会话"
-                        )
+                self._pending_cursor_updates.pop(uid, None)
+                new_posts = await self.check_weibo(uid, persist_cursor=False)
+                cursor_update = self._pending_cursor_updates.pop(uid, None)
+                uid_targets = self._get_targets_for_uid(uid)
+                delivery_ids = self._persist_discovered_posts(
+                    uid, new_posts, uid_targets, msg_format, cursor_update
+                )
+                for delivery_id in delivery_ids:
+                    self._queue_pending_delivery(delivery_id)
+                if new_posts and uid_targets:
+                    self.plugin_logger.info(
+                        f"WeiboMonitor: UID {uid} 发现 {len(new_posts)} 条新微博，已写入可恢复推送队列"
+                    )
+                elif new_posts:
+                    self.plugin_logger.debug(
+                        f"WeiboMonitor: UID {uid} 没有可推送的目标会话"
+                    )
             except Exception as e:
                 self.plugin_logger.error(f"WeiboMonitor: 检查URL {url} 时出错: {e}")
 
@@ -3533,17 +3651,69 @@ class WeiboMonitor(Star):
             queue_item = None
             try:
                 queue_item = await self.push_queue.get()
-                post, targets, msg_format = queue_item
+                delivery_id = str(queue_item)
+                pending = self._data.get("_pending_deliveries", {})
+                delivery = (
+                    pending.get(delivery_id) if isinstance(pending, dict) else None
+                )
+                if not isinstance(delivery, dict):
+                    continue
+                post = delivery.get("post", {})
+                targets = list(delivery.get("pending_targets", []))
+                msg_format = delivery.get("message_format", self.message_format)
                 self.plugin_logger.info(
                     f"[推送队列] 开始推送 {post.get('username')} 的微博，队列剩余 {self.push_queue.qsize()}"
                 )
-                await self._send_post_to_targets(post, msg_format, targets)
+                result = await self._send_post_to_targets(
+                    post, msg_format, targets, skip_log=True
+                )
+                successful = list(result["successful_text_targets"])
+                previous_data = copy.deepcopy(self._data)
+                delivery["attempts"] = int(delivery.get("attempts", 0)) + 1
+                delivery["delivered_targets"] = list(
+                    dict.fromkeys(
+                        list(delivery.get("delivered_targets", [])) + successful
+                    )
+                )
+                delivery["pending_targets"] = [
+                    target for target in targets if target not in successful
+                ]
+                delivery["last_error"] = (
+                    ""
+                    if not delivery["pending_targets"]
+                    else "部分或全部目标未确认送达"
+                )
+                if delivery["pending_targets"]:
+                    retry_delay = min(
+                        3600, 60 * (2 ** min(delivery["attempts"] - 1, 6))
+                    )
+                    delivery["next_retry_at"] = (
+                        self._get_utc8_now() + timedelta(seconds=retry_delay)
+                    ).strftime("%Y-%m-%d %H:%M:%S")
+                else:
+                    delivery["next_retry_at"] = ""
+                write_log = successful and not delivery.get("log_written", False)
+                if write_log:
+                    self._data["last_push_time"] = self._get_utc8_now().strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    )
+                    delivery["log_written"] = True
+                if not delivery["pending_targets"]:
+                    pending.pop(delivery_id, None)
+                if not self._save_data():
+                    self._data = previous_data
+                    self.plugin_logger.error(
+                        f"[推送队列] {delivery_id} 的投递确认未能落盘，将保留待办以避免漏推"
+                    )
+                elif write_log:
+                    self._log_to_daily_file(post, delivery_count=len(successful))
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 self.plugin_logger.error(f"[推送队列] 推送出错: {e}")
             finally:
                 if queue_item is not None:
+                    self._queued_delivery_ids.discard(str(queue_item))
                     self.push_queue.task_done()
 
     async def _send_new_posts(
@@ -3714,7 +3884,10 @@ class WeiboMonitor(Star):
         return valid_mblogs, username
 
     async def check_weibo(
-        self, uid: str, force_fetch: bool = False
+        self,
+        uid: str,
+        force_fetch: bool = False,
+        persist_cursor: bool = True,
     ) -> List[Dict[str, Any]]:
         """
         检查指定UID的最新微博。
@@ -3751,9 +3924,7 @@ class WeiboMonitor(Star):
             last_id = int(last_id_str)
 
             # 初始化检查：全新监控或会话首次检查
-            if not force_fetch and (
-                last_id == 0 or uid not in self.session_initialized_uids
-            ):
+            if not force_fetch and last_id == 0:
                 return await self._initialize_monitor(
                     uid, username, valid_mblogs, last_id_key, last_id
                 )
@@ -3765,9 +3936,17 @@ class WeiboMonitor(Star):
                 uid, valid_mblogs, last_id, force_fetch, username
             )
 
-            # 更新最新ID
+            # 手动检查不动游标；自动检查由 outbox 与待投递项原子落盘。
             if not force_fetch:
-                await self._update_last_id(valid_mblogs, last_id, last_id_key)
+                latest_id_val = valid_mblogs[0].get("id")
+                if latest_id_val and int(latest_id_val) > last_id:
+                    if persist_cursor:
+                        await self.put_kv_data(last_id_key, str(int(latest_id_val)))
+                    else:
+                        self._pending_cursor_updates[uid] = (
+                            last_id_key,
+                            str(int(latest_id_val)),
+                        )
 
             if new_posts:
                 self.plugin_logger.info(
@@ -3897,6 +4076,8 @@ class WeiboMonitor(Star):
 
             new_posts.append(
                 {
+                    "_post_id": str(current_id),
+                    "_uid": uid,
                     "text": text,
                     "link": link,
                     "username": username,
