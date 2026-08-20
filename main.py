@@ -89,7 +89,7 @@ CONFIG_KEY_GROUPS = {
     "astrbot_plugin_weibo_monitor",
     "Sayaka",
     "定时监控微博用户动态并推送到指定会话，支持按会话分组订阅不同博主。",
-    "v1.19.10",
+    "v1.20.0",
     "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor",
 )
 class WeiboMonitor(Star):
@@ -140,6 +140,7 @@ class WeiboMonitor(Star):
         self.running = True
         self.session_initialized_uids: set[str] = set()
         self.last_summary_date: str = ""
+        self._invalid_daily_summary_time_warned = ""
         self._request_semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
         self._consecutive_errors = 0
         self._max_error_backoff = 300  # 最大退避时间5分钟
@@ -270,7 +271,7 @@ class WeiboMonitor(Star):
             return
         self.config[key] = value
 
-    def _migrate_grouped_config(self):
+    def _migrate_grouped_config(self, *, persist: bool = True):
         """将 v1.18.x 的扁平配置一次性复制到分组配置中。"""
         if self.config.get("_config_schema_version", 0) >= 1:
             return
@@ -289,8 +290,53 @@ class WeiboMonitor(Star):
 
         self.config["_config_schema_version"] = 1
         changed = True
-        if changed:
+        if changed and persist:
             self._save_plugin_config("分组配置迁移")
+
+    def _take_persistence_snapshot(self) -> Dict[str, Any]:
+        """保存配置命令修改前的运行时状态，供失败时完整回滚。"""
+        return {
+            "config": copy.deepcopy(dict(self.config)),
+            "data": copy.deepcopy(self._data),
+            "cookie_health_status": self.cookie_health_status,
+            "cookie_health_checked_at": self.cookie_health_checked_at,
+            "cookie_invalid_notified": self.cookie_invalid_notified,
+        }
+
+    def _restore_persistence_snapshot(self, snapshot: Dict[str, Any]):
+        """原地恢复配置对象与 Cookie 状态，保留 AstrBotConfig 对象身份。"""
+        self.config.clear()
+        self.config.update(copy.deepcopy(snapshot["config"]))
+        self._data = copy.deepcopy(snapshot["data"])
+        self.cookie_health_status = snapshot["cookie_health_status"]
+        self.cookie_health_checked_at = snapshot["cookie_health_checked_at"]
+        self.cookie_invalid_notified = snapshot["cookie_invalid_notified"]
+
+    async def _rollback_persistence_snapshot(
+        self, snapshot: Dict[str, Any], reason: str
+    ) -> bool:
+        """恢复运行时旧值，并尽力将旧配置补偿写回框架。"""
+        self._restore_persistence_snapshot(snapshot)
+        return await self._save_plugin_config_async(reason)
+
+    def _stage_subscription_backup_from_config(self):
+        """将当前有效订阅配置写入内存快照，稍后由调用方统一落盘。"""
+        mappings = self.config.get("subscription_mappings", [])
+        if isinstance(mappings, str):
+            mappings = [item.strip() for item in mappings.splitlines() if item.strip()]
+        if not isinstance(mappings, list):
+            mappings = []
+
+        delivery_options = self.config.get("subscription_delivery_options", {})
+        if not isinstance(delivery_options, dict):
+            delivery_options = {}
+
+        self._data["_subscription_page_backup"] = {
+            "subscription_mappings": copy.deepcopy(mappings),
+            "subscription_delivery_options": copy.deepcopy(delivery_options),
+            "weibo_urls": self._parse_urls(self._get_config("weibo_urls", [])),
+            "saved_at": self._get_utc8_now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
 
     async def _save_plugin_config_async(self, reason: str = "配置") -> bool:
         """等待 AstrBot 配置真正持久化完成，供页面保存接口确认结果。"""
@@ -299,23 +345,23 @@ class WeiboMonitor(Star):
             if callable(save_async):
                 result = save_async()
                 if inspect.isawaitable(result):
-                    await result
-                return True
+                    result = await result
+                return result is not False
 
             save_sync = getattr(self.config, "save_config", None)
             if callable(save_sync):
                 result = save_sync()
                 if inspect.isawaitable(result):
-                    await result
-                return True
+                    result = await result
+                return result is not False
 
             if hasattr(self.context, "config_manager") and hasattr(
                 self.context.config_manager, "save_config"
             ):
                 result = self.context.config_manager.save_config()
                 if inspect.isawaitable(result):
-                    await result
-                return True
+                    result = await result
+                return result is not False
         except Exception as e:
             self.plugin_logger.warning(f"{reason}保存失败: {e}")
             return False
@@ -2432,6 +2478,7 @@ class WeiboMonitor(Star):
             "不要在 ID 后添加“: *”或微博 UID，页面会根据选择自动保存接收范围。"
         )
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("weibo_export")
     async def weibo_export(self, event: AstrMessageEvent):
         """导出当前插件配置"""
@@ -2446,9 +2493,11 @@ class WeiboMonitor(Star):
             self.plugin_logger.error(f"WeiboMonitor: 导出配置失败: {e}")
             yield event.plain_result(f"❌ 导出配置失败: {e}")
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("weibo_import")
     async def weibo_import(self, event: AstrMessageEvent, config_str: str = ""):
         """从导出的字符串导入配置"""
+        snapshot = None
         message_str: str = event.message_str or ""
         if message_str:
             parts = message_str.split(maxsplit=1)
@@ -2472,6 +2521,10 @@ class WeiboMonitor(Star):
             if not isinstance(new_config, dict):
                 raise ValueError("配置格式不正确")
 
+            snapshot = self._take_persistence_snapshot()
+            previous_cookie = self._get_cookie_value()
+            previous_monitor_urls = self._parse_urls(self._get_config("weibo_urls", []))
+
             # 兼容性合并：保持当前版本已有的键，仅更新导入的键
             # 即使未来增加了更多配置项，此导入逻辑依然稳健
             count = 0
@@ -2484,34 +2537,103 @@ class WeiboMonitor(Star):
                 key in CONFIG_KEY_GROUPS for key in new_config
             ):
                 self.config["_config_schema_version"] = 0
-                self._migrate_grouped_config()
+                self._migrate_grouped_config(persist=False)
 
-            # 尝试重新设置日志（如果配置有变）
-            self.setup_logging()
-
-            # 尝试调用框架的配置保存接口（如果支持）
-            try:
-                if hasattr(self.context, "config_manager") and hasattr(
-                    self.context.config_manager, "save_config"
-                ):
-                    self.context.config_manager.save_config()
-            except Exception:
-                pass
-
-            # 兜底：如果导入的配置包含 Cookie，同步写入 _data 持久化文件
-            imported_cookie = self._get_config("weibo_cookie", "")
-            if imported_cookie:
-                self._set_cookie_health_status("unknown")
+            imported_account_settings = new_config.get("account_settings")
+            cookie_explicitly_imported = "weibo_cookie" in new_config or (
+                isinstance(imported_account_settings, dict)
+                and "weibo_cookie" in imported_account_settings
+            )
+            imported_cookie = self._get_cookie_value()
+            cookie_changed = imported_cookie != previous_cookie
+            data_changed = False
+            if cookie_explicitly_imported or cookie_changed:
                 self._data["_backup_weibo_cookie"] = imported_cookie
-                self._save_data()
+                if cookie_changed:
+                    self.cookie_invalid_notified = False
+                    self.cookie_health_status = (
+                        "unknown" if imported_cookie else "unconfigured"
+                    )
+                    self.cookie_health_checked_at = ""
+                    self._data["_cookie_health_status"] = self.cookie_health_status
+                    self._data["_cookie_health_checked_at"] = ""
+                    self._data["_cookie_fingerprint"] = self._cookie_fingerprint(
+                        imported_cookie
+                    )
+                data_changed = True
+
+            current_monitor_urls = self._parse_urls(self._get_config("weibo_urls", []))
+            subscription_touched = (
+                any(
+                    key in new_config
+                    for key in (
+                        "subscription_mappings",
+                        "subscription_delivery_options",
+                    )
+                )
+                or "weibo_urls" in new_config
+            )
+            if isinstance(imported_account_settings, dict):
+                subscription_touched = (
+                    subscription_touched or "weibo_urls" in imported_account_settings
+                )
+            if current_monitor_urls != previous_monitor_urls:
+                subscription_touched = True
+            if subscription_touched:
+                self._stage_subscription_backup_from_config()
+                data_changed = True
+
+            if not await self._save_plugin_config_async("配置导入"):
+                rollback_saved = await self._rollback_persistence_snapshot(
+                    snapshot, "配置导入失败回滚"
+                )
+                rollback_note = (
+                    "旧配置已恢复。"
+                    if rollback_saved
+                    else "旧配置已恢复到当前运行时，但磁盘状态无法确认，请检查插件日志。"
+                )
+                yield event.plain_result(f"❌ 配置导入未能持久化，{rollback_note}")
+                return
+
+            if data_changed and not self._save_data():
+                rollback_saved = await self._rollback_persistence_snapshot(
+                    snapshot, "配置导入数据保存失败回滚"
+                )
+                rollback_note = (
+                    "已恢复并重新保存旧配置。"
+                    if rollback_saved
+                    else "已恢复当前运行时旧值，但磁盘配置状态无法确认，请勿立即重载并检查插件日志。"
+                )
+                yield event.plain_result(
+                    f"❌ 配置导入的恢复数据未能保存，{rollback_note}"
+                )
+                return
+
+            # 只有全部持久化完成后才应用日志配置等运行时副作用。
+            try:
+                self.setup_logging()
+            except Exception as error:
+                self.plugin_logger.warning(
+                    f"配置已导入，但运行日志设置刷新失败（重载后会重新应用）: {error}"
+                )
 
             yield event.plain_result(
                 f"✅ 成功导入 {count} 项配置！\n"
                 f"注意：部分配置（如检查间隔）可能需要重启插件后才能完全生效。导入后请先刷新插件后台页面，否则配置无法显示。"
             )
         except Exception as e:
+            rollback_note = ""
+            if snapshot is not None:
+                rollback_saved = await self._rollback_persistence_snapshot(
+                    snapshot, "配置导入异常回滚"
+                )
+                rollback_note = (
+                    "，旧配置已恢复"
+                    if rollback_saved
+                    else "，当前运行时旧值已恢复，但磁盘状态无法确认"
+                )
             self.plugin_logger.error(f"WeiboMonitor: 导入配置失败: {e}")
-            yield event.plain_result(f"❌ 导入配置失败: {e}")
+            yield event.plain_result(f"❌ 导入配置失败: {e}{rollback_note}")
 
     @filter.command("weibo_verify")
     async def weibo_verify(self, event: AstrMessageEvent):
@@ -2562,6 +2684,7 @@ class WeiboMonitor(Star):
             self.plugin_logger.error(f"WeiboMonitor: 验证过程中出现错误: {e}")
             yield event.plain_result(f"⚠️ 暂时无法验证 Cookie: {e}")
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("weibo_cookie")
     async def weibo_cookie(self, event: AstrMessageEvent, cookie: str = ""):
         """更换微博 Cookie 并自动重载插件"""
@@ -2577,29 +2700,40 @@ class WeiboMonitor(Star):
             )
             return
 
+        snapshot = self._take_persistence_snapshot()
         self._set_config("weibo_cookie", cookie)
         self.cookie_invalid_notified = False
-        self._set_cookie_health_status("unknown")
-
-        try:
-            if hasattr(self.context, "config_manager") and hasattr(
-                self.context.config_manager, "save_config"
-            ):
-                self.context.config_manager.save_config()
-                saved = True
-            else:
-                saved = False
-        except Exception as e:
-            self.plugin_logger.error(f"WeiboMonitor: 保存配置失败: {e}")
-            saved = False
-
-        # 兜底：将 Cookie 写入 _data 持久化文件，防止框架配置保存失败时丢失
+        self.cookie_health_status = "unknown"
+        self.cookie_health_checked_at = ""
         self._data["_backup_weibo_cookie"] = cookie
-        self._save_data()
-        if not saved:
-            saved = True
+        self._data["_cookie_health_status"] = "unknown"
+        self._data["_cookie_health_checked_at"] = ""
+        self._data["_cookie_fingerprint"] = self._cookie_fingerprint(cookie)
 
-        yield event.plain_result("🔄 Cookie 已更新，正在验证有效性...")
+        framework_saved = await self._save_plugin_config_async("Cookie 配置")
+        if not framework_saved:
+            rollback_saved = await self._rollback_persistence_snapshot(
+                snapshot, "Cookie 配置失败回滚"
+            )
+            rollback_note = (
+                "旧 Cookie 已恢复。"
+                if rollback_saved
+                else "旧 Cookie 已恢复到当前运行时，但磁盘状态无法确认，请检查插件日志。"
+            )
+            yield event.plain_result(f"❌ Cookie 未能持久化，{rollback_note}")
+            return
+
+        backup_saved = self._save_data()
+        if backup_saved:
+            persistence_message = "✅ 配置与插件兜底备份均已持久化保存"
+        else:
+            persistence_message = (
+                "⚠️ 主配置已持久化，但插件兜底备份保存失败；请检查插件数据目录权限"
+            )
+
+        yield event.plain_result(
+            f"🔄 Cookie 已可靠保存，正在验证有效性...\n{persistence_message}"
+        )
         try:
             resp = await self.client.get(
                 "https://m.weibo.cn/api/config", headers=self.get_headers()
@@ -2609,20 +2743,18 @@ class WeiboMonitor(Star):
                 data_obj = data.get("data") or {}
                 login = data_obj.get("login")
                 if login is True:
-                    self._set_cookie_health_status("valid")
+                    if not self._set_cookie_health_status("valid"):
+                        self.plugin_logger.warning(
+                            "WeiboMonitor: Cookie 已验证有效，但健康状态未能落盘"
+                        )
                     user = data_obj.get("user")
                     user_info = (
                         f"当前登录用户: {user.get('screen_name')} (UID: {user.get('id')})"
                         if user
                         else f"已登录 (UID: {data_obj.get('uid')})"
                     )
-                    save_msg = (
-                        "✅ 配置已持久化保存"
-                        if saved
-                        else "⚠️ 配置已更新但未能持久化保存，重启后可能丢失"
-                    )
                     self.plugin_logger.info(
-                        f"WeiboMonitor: Cookie 已通过命令更换，{save_msg}"
+                        f"WeiboMonitor: Cookie 已通过命令更换，{persistence_message}"
                     )
                     next_step = ""
                     if not self._get_all_subscribed_sessions():
@@ -2632,7 +2764,7 @@ class WeiboMonitor(Star):
                             "否则自动检查的微博动态无人接收。"
                         )
                     yield event.plain_result(
-                        f"✅ Cookie 更换成功！{user_info}\n{save_msg}\n"
+                        f"✅ Cookie 更换成功！{user_info}\n{persistence_message}\n"
                         f"{next_step}\n"
                         f"🔄 正在重载插件..."
                     )
@@ -2657,22 +2789,32 @@ class WeiboMonitor(Star):
                             "⚠️ 自动重载失败，请手动在 WebUI 插件管理中点击「重载插件」。\n💡 新 Cookie 已生效，无需重载亦可正常使用。"
                         )
                 elif login is False:
-                    self._set_cookie_health_status("invalid")
+                    if not self._set_cookie_health_status("invalid"):
+                        self.plugin_logger.warning(
+                            "WeiboMonitor: Cookie 已验证失效，但健康状态未能落盘"
+                        )
                     yield event.plain_result(
                         "❌ Cookie 已更新但验证失败（接口返回 login: false），请检查 Cookie 是否正确。"
                     )
                 else:
-                    self._set_cookie_health_status("error")
+                    if not self._set_cookie_health_status("error"):
+                        self.plugin_logger.warning(
+                            "WeiboMonitor: Cookie 验证状态未能落盘"
+                        )
                     yield event.plain_result(
                         "⚠️ Cookie 已更新，但微博接口返回了无法识别的登录状态。新 Cookie 已保存，请稍后使用 /weibo_verify 重试。"
                     )
             else:
-                self._set_cookie_health_status("error")
+                if not self._set_cookie_health_status("error"):
+                    self.plugin_logger.warning(
+                        "WeiboMonitor: Cookie 验证错误状态未能落盘"
+                    )
                 yield event.plain_result(
                     f"⚠️ Cookie 已更新，但暂时无法验证，接口状态码: {resp.status_code}。新 Cookie 已保存，请稍后使用 /weibo_verify 重试。"
                 )
         except Exception as e:
-            self._set_cookie_health_status("error")
+            if not self._set_cookie_health_status("error"):
+                self.plugin_logger.warning("WeiboMonitor: Cookie 验证异常状态未能落盘")
             self.plugin_logger.error(f"WeiboMonitor: 更换 Cookie 后验证出错: {e}")
             yield event.plain_result(
                 f"⚠️ Cookie 已更新，但暂时无法完成验证: {e}。请稍后使用 /weibo_verify 重试。"
@@ -2967,6 +3109,11 @@ class WeiboMonitor(Star):
         status_lines.append(
             f"- Cookie：{cookie_labels.get(readiness['cookie_status'], '⏳ 待验证')}"
         )
+        status_lines.append(
+            "- 敏感命令：/weibo_export、/weibo_import、/weibo_cookie 仅 AstrBot "
+            "全局管理员可用（请在 AstrBot 的 admins_id/“管理员 ID”中配置，"
+            "不在本插件中配置）"
+        )
         readiness_icons = {
             "ready": "✅",
             "degraded": "⚠️",
@@ -3240,7 +3387,7 @@ class WeiboMonitor(Star):
             self.plugin_logger.debug(f"WeiboMonitor: 检查 Cookie 健康状态失败: {e}")
             return "error"
 
-    def _set_cookie_health_status(self, status: str):
+    def _set_cookie_health_status(self, status: str) -> bool:
         """更新 Cookie 健康状态，供页面展示；状态保存失败不影响监控。"""
         if status not in {"valid", "invalid", "unknown", "error", "unconfigured"}:
             status = "unknown"
@@ -3256,7 +3403,8 @@ class WeiboMonitor(Star):
             self._data["_cookie_fingerprint"] = self._cookie_fingerprint(
                 self._get_cookie_value()
             )
-            self._save_data()
+            return self._save_data()
+        return True
 
     async def run_monitor(self):
         """后台监控主循环"""
@@ -3292,21 +3440,25 @@ class WeiboMonitor(Star):
                         last_cleanup_time = asyncio.get_event_loop().time()
 
                 # 1. 检查是否需要发送每日总结
-                summary_time = self._get_config("daily_summary_time", "08:00")
                 if self._get_config("enable_daily_summary", False):
-                    should_send_summary = False
-                    if (
+                    raw_summary_time = self._get_config("daily_summary_time", "08:00")
+                    summary_time = str(raw_summary_time).strip()
+                    if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", summary_time):
+                        warning_key = repr(raw_summary_time)
+                        if self._invalid_daily_summary_time_warned != warning_key:
+                            self.plugin_logger.warning(
+                                "WeiboMonitor: daily_summary_time 配置无效，"
+                                f"应为 HH:MM（00:00-23:59），当前值为 {warning_key}；"
+                                "本次运行回退到 08:00。"
+                            )
+                            self._invalid_daily_summary_time_warned = warning_key
+                        summary_time = "08:00"
+                    else:
+                        self._invalid_daily_summary_time_warned = ""
+                    should_send_summary = (
                         self.last_summary_date != current_date_str
                         and current_time_str >= summary_time
-                    ):
-                        should_send_summary = True
-                    elif (
-                        self.last_summary_date
-                        and self.last_summary_date < current_date_str
-                        and now.hour >= 8
-                        and (int(now.strftime("%H%M")) - 800) < 10
-                    ):
-                        should_send_summary = True
+                    )
 
                     if should_send_summary:
                         self.plugin_logger.info(

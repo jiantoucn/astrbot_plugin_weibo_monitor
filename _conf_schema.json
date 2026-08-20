@@ -10,10 +10,10 @@
   "account_settings": {
     "type": "object",
     "description": "微博账号与认证",
-    "hint": "配置需要监控的微博账号和访问凭据。",
+    "hint": "配置需要监控的微博账号和访问凭据。注意：导出、导入和 Cookie 命令所需的管理员 ID 必须在 AstrBot 全局 admins_id/“管理员 ID”中配置，不在本插件中配置。",
     "items": {
       "weibo_urls": {"type": "list", "item_type": "string", "default": [], "invisible": true},
-      "weibo_cookie": {"type": "string", "default": "", "description": "微博 Cookie", "hint": "微博动态抓取必须配置。填写后还需在插件详情页的“订阅分组管理”中添加接收会话。", "obvious_hint": true},
+      "weibo_cookie": {"type": "string", "default": "", "description": "微博 Cookie", "hint": "微博动态抓取必须配置。填写后还需在插件详情页的“订阅分组管理”中添加接收会话。使用 /weibo_cookie 时，请先在 AstrBot 全局配置中添加管理员 ID；本插件没有独立管理员配置。", "obvious_hint": true},
       "cookie_notification_target": {"type": "string", "default": "", "description": "管理与配置提醒目标", "hint": "可选。请在目标群聊或私聊执行 /weibo_umo，并填写命令返回的完整会话 ID；不要填写平台原始群号或用户号。用于 Cookie 未配置、Cookie 失效或尚未配置订阅分组等管理提醒。"}
     }
   },
@@ -78,7 +78,7 @@
       "plugin_log_max_size": {"type": "int", "default": 1, "description": "日志文件最大大小（MB）"},
       "enable_daily_log": {"type": "bool", "default": true, "description": "开启每日推送记录"},
       "enable_daily_summary": {"type": "bool", "default": true, "description": "开启每日发送总结"},
-      "daily_summary_time": {"type": "string", "default": "08:00", "description": "每日总结推送时间"}
+      "daily_summary_time": {"type": "string", "default": "08:00", "description": "每日总结推送时间", "hint": "UTC+8 时间，请使用 HH:MM 格式，例如 20:00。错过设定时间后在当日首次检查时补发。"}
     }
   },
   "hotsearch_settings": {
