@@ -34,6 +34,7 @@
     "hint": "设置需要推送的微博类型和消息格式。",
     "items": {
       "message_format": {"type": "string", "default": "🔔 {name} 发微博啦！\n\n{weibo}\n\n链接: {link}", "description": "推送消息格式", "hint": "支持 {name}、{weibo}、{link}。"},
+      "show_full_weibo_text": {"type": "bool", "default": false, "description": "完整展示超长微博正文", "hint": "默认关闭并使用列表摘要。开启后会为超长微博额外请求全文；获取失败时自动回退摘要。"},
       "send_original": {"type": "bool", "default": true, "description": "推送原创微博"},
       "send_forward": {"type": "bool", "default": true, "description": "推送转发微博"}
     }
@@ -103,6 +104,7 @@
   "request_interval": {"type": "int", "default": 5, "invisible": true},
   "request_interval_jitter": {"type": "int", "default": 1, "invisible": true},
   "message_format": {"type": "string", "default": "🔔 {name} 发微博啦！\n\n{weibo}\n\n链接: {link}", "invisible": true},
+  "show_full_weibo_text": {"type": "bool", "default": false, "invisible": true},
   "enable_image_download": {"type": "bool", "default": true, "invisible": true},
   "max_images_per_post": {"type": "int", "default": 0, "invisible": true},
   "enable_video_download": {"type": "bool", "default": true, "invisible": true},

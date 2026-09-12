@@ -12,7 +12,7 @@ import copy
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Tuple, Dict, Any
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote, urlparse
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.star import Context, Star, register, StarTools
 from astrbot.api.web import error_response, json_response, request
@@ -52,7 +52,12 @@ CONFIG_GROUPS = {
         "request_interval",
         "request_interval_jitter",
     ),
-    "content_settings": ("message_format", "send_original", "send_forward"),
+    "content_settings": (
+        "message_format",
+        "show_full_weibo_text",
+        "send_original",
+        "send_forward",
+    ),
     "media_settings": (
         "enable_image_download",
         "max_images_per_post",
@@ -89,7 +94,7 @@ CONFIG_KEY_GROUPS = {
     "astrbot_plugin_weibo_monitor",
     "Sayaka",
     "定时监控微博用户动态并推送到指定会话，支持按会话分组订阅不同博主。",
-    "v1.20.0",
+    "v1.21.0",
     "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor",
 )
 class WeiboMonitor(Star):
@@ -1947,8 +1952,61 @@ class WeiboMonitor(Star):
         await self.client.aclose()
         self.plugin_logger.info("WeiboMonitor 插件已停止")
 
-    def _extract_image_urls(self, mblog: dict) -> List[str]:
-        """从微博博文数据中提取高清图片 URL 列表"""
+    @staticmethod
+    def _normalize_inline_image_url(candidate: str) -> Optional[str]:
+        """解析正文中的微博图片跳转链接，并限制为新浪图床地址。"""
+        if not isinstance(candidate, str):
+            return None
+
+        candidate = candidate.strip()
+        if candidate.startswith("//"):
+            candidate = "https:" + candidate
+
+        try:
+            parsed = urlparse(candidate)
+            host = (parsed.hostname or "").lower()
+            if (
+                host in {"weibo.cn", "www.weibo.cn"}
+                and parsed.path.rstrip("/") == "/sinaurl"
+            ):
+                candidate = (parse_qs(parsed.query).get("u") or [""])[0].strip()
+                if candidate.startswith("//"):
+                    candidate = "https:" + candidate
+                parsed = urlparse(candidate)
+
+            if parsed.scheme not in {"http", "https"}:
+                return None
+            host = (parsed.hostname or "").lower()
+            if host != "sinaimg.cn" and not host.endswith(".sinaimg.cn"):
+                return None
+            return candidate
+        except (TypeError, ValueError):
+            return None
+
+    def _extract_inline_image_urls(self, text_html: str) -> List[str]:
+        """提取正文“查看图片”等链接中携带的新浪图床原图。"""
+        if not isinstance(text_html, str) or not text_html:
+            return []
+
+        try:
+            soup = BeautifulSoup(text_html, "html.parser")
+            image_urls = []
+            for anchor in soup.find_all("a"):
+                for attribute in ("href", "data-url"):
+                    image_url = self._normalize_inline_image_url(
+                        anchor.get(attribute, "")
+                    )
+                    if image_url and image_url not in image_urls:
+                        image_urls.append(image_url)
+            return image_urls
+        except Exception as e:
+            self.plugin_logger.warning(f"解析微博正文内图片链接失败: {e}")
+            return []
+
+    def _extract_image_urls(
+        self, mblog: dict, text_html: Optional[str] = None
+    ) -> List[str]:
+        """从微博图片字段及正文内链中提取高清图片 URL 列表。"""
         image_urls = []
         pics = mblog.get("pics") or []
         for pic in pics:
@@ -1956,9 +2014,15 @@ class WeiboMonitor(Star):
                 continue
             large = pic.get("large") or {}
             url = large.get("url") or pic.get("url")
-            if url:
+            if isinstance(url, str) and url:
                 if url.startswith("//"):
                     url = "https:" + url
+                if url not in image_urls:
+                    image_urls.append(url)
+
+        source_html = mblog.get("text", "") if text_html is None else text_html
+        for url in self._extract_inline_image_urls(source_html):
+            if url not in image_urls:
                 image_urls.append(url)
         return image_urls
 
@@ -2379,6 +2443,52 @@ class WeiboMonitor(Star):
         except Exception as e:
             self.plugin_logger.error(f"抓取单条微博出错: {e}，bid: {bid}")
             return None
+
+    async def _resolve_mblog_text_html(self, mblog: dict, uid: str = "") -> str:
+        """按配置获取微博正文；全文失败时安全回退列表摘要。"""
+        summary_html = mblog.get("text", "")
+        if not self._get_config("show_full_weibo_text", False) or not mblog.get(
+            "isLongText"
+        ):
+            return summary_html
+
+        status_id = mblog.get("id") or mblog.get("idstr") or mblog.get("mid")
+        if not status_id:
+            self.plugin_logger.warning("长微博缺少状态 ID，继续使用摘要正文")
+            return summary_html
+
+        api_url = (
+            f"{WEIBO_MOBILE_BASE}/statuses/extend?id={quote(str(status_id), safe='')}"
+        )
+        try:
+            async with self._request_semaphore:
+                resp = await self.client.get(api_url, headers=self.get_headers(uid))
+            if resp.status_code != 200:
+                self.plugin_logger.warning(
+                    f"获取长微博全文失败，状态码: {resp.status_code}，ID: {status_id}，"
+                    "继续使用摘要正文"
+                )
+                return summary_html
+
+            payload = resp.json()
+            data = payload.get("data") if isinstance(payload, dict) else None
+            long_text = data.get("longTextContent") if isinstance(data, dict) else None
+            if (
+                isinstance(payload, dict)
+                and payload.get("ok") == 1
+                and isinstance(long_text, str)
+                and long_text
+            ):
+                return long_text
+
+            self.plugin_logger.warning(
+                f"长微博全文响应缺少正文，ID: {status_id}，继续使用摘要正文"
+            )
+        except Exception as e:
+            self.plugin_logger.warning(
+                f"获取长微博全文出错: {e}，ID: {status_id}，继续使用摘要正文"
+            )
+        return summary_html
 
     def _iter_mappings(self):
         """统一解析 subscription_mappings，自动规范化缺失的 :*。
@@ -3097,6 +3207,10 @@ class WeiboMonitor(Star):
 
         check_interval = self._get_config("check_interval", DEFAULT_CHECK_INTERVAL)
         status_lines.append(f"- 检查间隔：{check_interval} 分钟")
+        full_text_enabled = self._get_config("show_full_weibo_text", False)
+        status_lines.append(
+            f"- 超长微博全文：{'✅ 开启' if full_text_enabled else '❌ 关闭（使用摘要）'}"
+        )
 
         readiness = self._get_weibo_push_readiness()
         cookie_labels = {
@@ -4084,7 +4198,7 @@ class WeiboMonitor(Star):
             self.session_initialized_uids.add(uid)
 
             # 收集新微博
-            new_posts = self._collect_new_posts(
+            new_posts = await self._collect_new_posts(
                 uid, valid_mblogs, last_id, force_fetch, username
             )
 
@@ -4164,7 +4278,7 @@ class WeiboMonitor(Star):
                 )
         return []
 
-    def _collect_new_posts(
+    async def _collect_new_posts(
         self,
         uid: str,
         valid_mblogs: List[Dict[str, Any]],
@@ -4202,7 +4316,15 @@ class WeiboMonitor(Star):
                 )
                 continue
 
-            text = self.clean_text(mblog.get("text", ""))
+            bid = mblog.get("bid")
+            if not bid:
+                self.plugin_logger.debug(
+                    f"WeiboMonitor: 微博 {current_id} 缺少bid字段，已跳过"
+                )
+                continue
+
+            text_html = await self._resolve_mblog_text_html(mblog, uid)
+            text = self.clean_text(text_html)
 
             # 屏蔽词过滤（黑名单）
             if self._has_filter_keyword(text, filter_keywords, current_id):
@@ -4213,17 +4335,11 @@ class WeiboMonitor(Star):
             if self._should_skip_by_whitelist(text, whitelist_keywords, current_id):
                 continue
 
-            bid = mblog.get("bid")
-            if not bid:
-                self.plugin_logger.debug(
-                    f"WeiboMonitor: 微博 {current_id} 缺少bid字段，已跳过"
-                )
-                continue
             link = f"{WEIBO_WEB_BASE}/{uid}/{bid}"
 
             created_at_raw = mblog.get("created_at")
             created_at = self._parse_weibo_time(created_at_raw)
-            image_urls = self._extract_image_urls(mblog)
+            image_urls = self._extract_image_urls(mblog, text_html)
             video_info = self._extract_video_info(mblog)
 
             new_posts.append(
