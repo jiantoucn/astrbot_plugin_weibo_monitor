@@ -68,7 +68,11 @@ CONFIG_GROUPS = {
         "temp_media_retention_minutes",
     ),
     "delivery_settings": ("message_send_timeout",),
-    "filter_settings": ("filter_keywords", "whitelist_keywords"),
+    "filter_settings": (
+        "max_post_age_minutes",
+        "filter_keywords",
+        "whitelist_keywords",
+    ),
     "logging_settings": (
         "enable_plugin_log",
         "plugin_log_max_size",
@@ -94,7 +98,7 @@ CONFIG_KEY_GROUPS = {
     "astrbot_plugin_weibo_monitor",
     "Sayaka",
     "定时监控微博用户动态并推送到指定会话，支持按会话分组订阅不同博主。",
-    "v1.21.0",
+    "v1.21.1",
     "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor",
 )
 class WeiboMonitor(Star):
@@ -1418,17 +1422,27 @@ class WeiboMonitor(Star):
                 yesterday = now - timedelta(days=1)
                 return f"{yesterday.strftime('%Y-%m-%d')} {time_part}:00"
 
-            if "-" in time_str:
-                parts = time_str.split("-")
-                if len(parts) == 2:  # MM-DD
-                    return f"{now.year}-{time_str} 00:00:00"
-                elif len(parts) == 3:  # YYYY-MM-DD
-                    return f"{time_str} 00:00:00"
+            if re.fullmatch(r"\d{2}-\d{2}", time_str):
+                dt = datetime.strptime(f"{now.year}-{time_str}", "%Y-%m-%d")
+                if dt.date() > now.date():
+                    dt = dt.replace(year=now.year - 1)
+                return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+            # 已标准化的时间和 ISO 时间不能再次追加 00:00:00。
+            try:
+                dt = datetime.fromisoformat(time_str)
+                if dt.tzinfo is not None:
+                    dt = dt.astimezone(timezone(timedelta(hours=8)))
+                return dt.strftime("%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                pass
 
             # 尝试解析微博标准时间格式: Sat Mar 08 16:51:30 +0800 2025
             try:
                 dt = datetime.strptime(time_str, "%a %b %d %H:%M:%S %z %Y")
-                return dt.strftime("%Y-%m-%d %H:%M:%S")
+                return dt.astimezone(timezone(timedelta(hours=8))).strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
             except ValueError:
                 pass
 
@@ -1436,6 +1450,49 @@ class WeiboMonitor(Star):
         except Exception as e:
             self.plugin_logger.error(f"解析微博时间失败 ({time_str}): {e}")
             return now.strftime("%Y-%m-%d %H:%M:%S")
+
+    def _should_skip_by_post_age(self, created_at: str, post_id: int) -> bool:
+        """根据配置过滤过旧微博；0 或无效值表示关闭。
+
+        时间无法解析时采用宽松策略，避免因微博接口时间格式变化而误删新消息。
+        """
+        try:
+            max_age_minutes = int(self._get_config("max_post_age_minutes", 0) or 0)
+        except (TypeError, ValueError):
+            return False
+        if max_age_minutes <= 0:
+            return False
+
+        try:
+            stored_time = created_at
+            if isinstance(stored_time, str):
+                # 旧解析器给已有时分秒（含 ISO 格式）的时间多加了午夜后缀。
+                # 恢复待办时也会经过这里；只修复已知格式，其他异常仍告警放行。
+                legacy_time = re.fullmatch(
+                    r"(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}"
+                    r"(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?) 00:00:00",
+                    stored_time,
+                )
+                if legacy_time:
+                    stored_time = legacy_time.group(1)
+            published_at = datetime.fromisoformat(stored_time)
+            if published_at.tzinfo is None:
+                published_at = published_at.replace(tzinfo=timezone(timedelta(hours=8)))
+        except (TypeError, ValueError):
+            self.plugin_logger.warning(
+                f"WeiboMonitor: 微博 {post_id} 的发布时间无法解析，未应用时效过滤: {created_at}"
+            )
+            return False
+
+        age = self._get_utc8_now() - published_at
+        if age > timedelta(minutes=max_age_minutes):
+            age_minutes = max(0, int(age.total_seconds() // 60))
+            self.plugin_logger.info(
+                f"WeiboMonitor: 微博 {post_id} 发布于约 {age_minutes} 分钟前，"
+                f"超过配置的 {max_age_minutes} 分钟，已跳过推送"
+            )
+            return True
+        return False
 
     def _log_to_daily_file(
         self,
@@ -2219,16 +2276,29 @@ class WeiboMonitor(Star):
         targets: List[str],
         skip_log: bool = False,
         failure_guidance: str = TARGET_ID_FAILURE_GUIDANCE,
+        enforce_post_age: bool = False,
     ) -> Dict[str, Any]:
         """发送单条微博到指定目标。
         文字与图片分别独立发送，解决飞书适配器图文混合消息文字丢失问题（统一应用于所有平台）。
         返回正文和媒体的结构化发送结果，供命令准确展示 X/Y。
         """
         attempted_targets = list(dict.fromkeys(targets))
+        skipped_targets = []
+
+        def expired() -> bool:
+            return enforce_post_age and self._should_skip_by_post_age(
+                post.get("created_at", ""), post.get("_post_id", "unknown")
+            )
+
+        if expired():
+            skipped_targets = attempted_targets
+            attempted_targets = []
         text_content = self._format_post_text(post, msg_format)
 
         # 图片下载和推送
-        image_enabled = self._get_config("enable_image_download", True)
+        image_enabled = bool(attempted_targets) and self._get_config(
+            "enable_image_download", True
+        )
         image_urls = list(post.get("image_urls", []))
         max_images = self._get_config("max_images_per_post", 0)
         if max_images > 0:
@@ -2258,6 +2328,10 @@ class WeiboMonitor(Star):
         successful_image_targets = []
         image_failed_targets = []
         for target in attempted_targets:
+            # 下载、排队或前一个会话发送期间也可能超过时效限制。
+            if expired():
+                skipped_targets.append(target)
+                continue
             try:
                 await self._send_message_with_timeout(target, text_chain)
                 successful_text_targets.append(target)
@@ -2268,7 +2342,7 @@ class WeiboMonitor(Star):
                 )
                 continue
 
-            if img_chain is not None:
+            if img_chain is not None and not expired():
                 try:
                     await self._send_message_with_timeout(target, img_chain)
                     successful_image_targets.append(target)
@@ -2293,7 +2367,12 @@ class WeiboMonitor(Star):
         video_available = bool(post.get("video_info"))
         video_path = None
         video_download_failed = False
-        if video_enabled and video_available:
+        if (
+            video_enabled
+            and video_available
+            and successful_text_targets
+            and not expired()
+        ):
             self.plugin_logger.info(
                 f"检测到视频微博，开始下载: {post.get('link', 'unknown')}"
             )
@@ -2329,7 +2408,7 @@ class WeiboMonitor(Star):
                 video_component_failed = True
                 self.plugin_logger.error(f"WeiboMonitor: 构造视频消息失败: {e}")
             for target in successful_text_targets:
-                if video_chain is None:
+                if video_chain is None or expired():
                     break
                 try:
                     if send_timeout > 0:
@@ -2356,6 +2435,7 @@ class WeiboMonitor(Star):
 
         return {
             "attempted_targets": attempted_targets,
+            "skipped_targets": skipped_targets,
             "successful_text_targets": successful_text_targets,
             "failed_text_targets": failed_text_targets,
             "image_count": len(image_paths) if successful_image_targets else 0,
@@ -3848,8 +3928,20 @@ class WeiboMonitor(Star):
         pending = self._data.get("_pending_deliveries", {})
         if not isinstance(pending, dict):
             return
+        expired_ids = [
+            delivery_id
+            for delivery_id, item in pending.items()
+            if isinstance(item, dict)
+            and self._should_skip_by_post_age(
+                item.get("post", {}).get("created_at", ""),
+                item.get("post_id", delivery_id),
+            )
+        ]
+        self._discard_expired_deliveries(expired_ids)
         candidates = []
         for delivery_id, item in pending.items():
+            if delivery_id in expired_ids:
+                continue
             if not isinstance(item, dict) or not item.get("pending_targets"):
                 continue
             next_retry_at = str(item.get("next_retry_at", "")).strip()
@@ -3866,6 +3958,29 @@ class WeiboMonitor(Star):
         for _, delivery_id in sorted(candidates):
             if not self._queue_pending_delivery(delivery_id):
                 return
+
+    def _discard_expired_deliveries(self, delivery_ids: List[str]):
+        """删除过期待办并落盘；不回退发现游标，也不计入推送统计。"""
+        if not delivery_ids:
+            return
+        pending = self._data.get("_pending_deliveries", {})
+        removed = {}
+        for delivery_id in delivery_ids:
+            if delivery_id in pending:
+                removed[delivery_id] = pending.pop(delivery_id)
+        if not removed:
+            return
+        if not self._save_data():
+            # 清理与保存均同步执行。只原地恢复删除项，保留正在等待发送的
+            # 消费者持有的字典和待办引用，确保其后续投递确认仍写入当前数据。
+            pending.update(removed)
+            self.plugin_logger.error(
+                "[推送队列] 过期待办清理未能落盘，本次仍不发送，稍后重试清理"
+            )
+            return
+        self.plugin_logger.info(
+            f"[推送队列] 已清理 {len(removed)} 条过期待办，不再重试推送"
+        )
 
     async def _process_monitor_cycle(
         self, urls: List[str], base_req_interval: int, req_jitter: int, msg_format: str
@@ -3925,15 +4040,21 @@ class WeiboMonitor(Star):
                 if not isinstance(delivery, dict):
                     continue
                 post = delivery.get("post", {})
+                if self._should_skip_by_post_age(
+                    post.get("created_at", ""), delivery.get("post_id", delivery_id)
+                ):
+                    self._discard_expired_deliveries([delivery_id])
+                    continue
                 targets = list(delivery.get("pending_targets", []))
                 msg_format = delivery.get("message_format", self.message_format)
                 self.plugin_logger.info(
                     f"[推送队列] 开始推送 {post.get('username')} 的微博，队列剩余 {self.push_queue.qsize()}"
                 )
                 result = await self._send_post_to_targets(
-                    post, msg_format, targets, skip_log=True
+                    post, msg_format, targets, skip_log=True, enforce_post_age=True
                 )
                 successful = list(result["successful_text_targets"])
+                skipped = result.get("skipped_targets", [])
                 previous_data = copy.deepcopy(self._data)
                 delivery["attempts"] = int(delivery.get("attempts", 0)) + 1
                 delivery["delivered_targets"] = list(
@@ -3942,8 +4063,15 @@ class WeiboMonitor(Star):
                     )
                 )
                 delivery["pending_targets"] = [
-                    target for target in targets if target not in successful
+                    target
+                    for target in targets
+                    if target not in successful and target not in skipped
                 ]
+                # 最后一个目标失败或媒体下载完成时也可能刚好过期。
+                if delivery["pending_targets"] and self._should_skip_by_post_age(
+                    post.get("created_at", ""), delivery.get("post_id", delivery_id)
+                ):
+                    delivery["pending_targets"] = []
                 delivery["last_error"] = (
                     ""
                     if not delivery["pending_targets"]
@@ -4158,7 +4286,7 @@ class WeiboMonitor(Star):
         """
         检查指定UID的最新微博。
         :param uid: 微博用户ID
-        :param force_fetch: 是否强制获取最新一条（不比较last_id）
+        :param force_fetch: 是否手动获取最新一条（不比较last_id、不应用时效过滤）
         :return: 包含新微博信息的列表
         """
         try:
@@ -4339,6 +4467,11 @@ class WeiboMonitor(Star):
 
             created_at_raw = mblog.get("created_at")
             created_at = self._parse_weibo_time(created_at_raw)
+            # 手动检查只绕过时效限制，仍保留关键词及原创/转发过滤。
+            if not force_fetch and self._should_skip_by_post_age(
+                created_at, current_id
+            ):
+                continue
             image_urls = self._extract_image_urls(mblog, text_html)
             video_info = self._extract_video_info(mblog)
 

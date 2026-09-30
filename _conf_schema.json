@@ -64,8 +64,9 @@
   "filter_settings": {
     "type": "object",
     "description": "内容过滤",
-    "hint": "按照微博正文关键词决定是否推送。",
+    "hint": "按照微博发布时间和正文关键词决定是否推送。",
     "items": {
+      "max_post_age_minutes": {"type": "int", "default": 0, "description": "不推送超过此时长的微博（分钟）", "hint": "例如填写 30，则跳过发布时间已超过 30 分钟的微博；0 表示不限制。对自动推送的旧待办恢复、失败重试和发送前检查均生效，过期待办自动清除。/weibo_check 和 /weibo_check_all 手动检查不受此限制。"},
       "filter_keywords": {"type": "list", "item_type": "string", "default": [], "description": "屏蔽词列表"},
       "whitelist_keywords": {"type": "list", "item_type": "string", "default": [], "description": "关键词白名单"}
     }
@@ -113,6 +114,7 @@
   "video_send_timeout": {"type": "int", "default": 60, "invisible": true},
   "temp_media_retention_minutes": {"type": "int", "default": 10, "invisible": true},
   "message_send_timeout": {"type": "int", "default": 60, "invisible": true},
+  "max_post_age_minutes": {"type": "int", "default": 0, "invisible": true},
   "filter_keywords": {"type": "list", "item_type": "string", "default": [], "invisible": true},
   "whitelist_keywords": {"type": "list", "item_type": "string", "default": [], "invisible": true},
   "send_original": {"type": "bool", "default": true, "invisible": true},
