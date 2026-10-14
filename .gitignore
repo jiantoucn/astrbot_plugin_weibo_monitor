@@ -176,3 +176,4 @@ Thumbs.db
 *.bak
 CODE_REVIEW_REPORT.md
 /tests
+ruff.toml

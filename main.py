@@ -1,23 +1,24 @@
 import asyncio
-import re
-import httpx
-import os
-import json
 import base64
+import copy
 import hashlib
 import inspect
-import random
+import json
 import logging
-import copy
-from logging.handlers import RotatingFileHandler
+import os
+import random
+import re
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional, Tuple, Dict, Any
+from logging.handlers import RotatingFileHandler
+from typing import Any
 from urllib.parse import parse_qs, quote, urlparse
-from astrbot.api.event import filter, AstrMessageEvent, MessageChain
-from astrbot.api.star import Context, Star, register, StarTools
+
+import astrbot.api.message_components as Comp
+import httpx
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+from astrbot.api.star import Context, Star, StarTools, register
 from astrbot.api.web import error_response, json_response, request
 from bs4 import BeautifulSoup
-import astrbot.api.message_components as Comp
 
 # 常量定义
 DEFAULT_CHECK_INTERVAL = 10  # 默认检查间隔（分钟）
@@ -98,20 +99,20 @@ CONFIG_KEY_GROUPS = {
     "astrbot_plugin_weibo_monitor",
     "Sayaka",
     "定时监控微博用户动态并推送到指定会话，支持按会话分组订阅不同博主。",
-    "v1.21.1",
+    "v1.22.0",
     "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor",
 )
 class WeiboMonitor(Star):
-    def __init__(self, context: Context, config: dict = None):
+    def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context)
         self.config = config or {}
-        self.monitor_task: Optional[asyncio.Task] = None
-        self.push_consumer_task: Optional[asyncio.Task] = None
-        self._migrate_persist_task: Optional[asyncio.Task] = None
+        self.monitor_task: asyncio.Task | None = None
+        self.push_consumer_task: asyncio.Task | None = None
+        self._migrate_persist_task: asyncio.Task | None = None
         self.cookie_invalid_notified = False  # cookie 失效是否已通知
         self.push_queue: asyncio.Queue = asyncio.Queue(maxsize=MAX_PUSH_QUEUE_SIZE)
         self._queued_delivery_ids: set[str] = set()
-        self._pending_cursor_updates: Dict[str, Tuple[str, str]] = {}
+        self._pending_cursor_updates: dict[str, tuple[str, str]] = {}
 
         # 确保数据目录存在
         self.data_dir = StarTools.get_data_dir()
@@ -302,7 +303,7 @@ class WeiboMonitor(Star):
         if changed and persist:
             self._save_plugin_config("分组配置迁移")
 
-    def _take_persistence_snapshot(self) -> Dict[str, Any]:
+    def _take_persistence_snapshot(self) -> dict[str, Any]:
         """保存配置命令修改前的运行时状态，供失败时完整回滚。"""
         return {
             "config": copy.deepcopy(dict(self.config)),
@@ -312,7 +313,7 @@ class WeiboMonitor(Star):
             "cookie_invalid_notified": self.cookie_invalid_notified,
         }
 
-    def _restore_persistence_snapshot(self, snapshot: Dict[str, Any]):
+    def _restore_persistence_snapshot(self, snapshot: dict[str, Any]):
         """原地恢复配置对象与 Cookie 状态，保留 AstrBotConfig 对象身份。"""
         self.config.clear()
         self.config.update(copy.deepcopy(snapshot["config"]))
@@ -322,7 +323,7 @@ class WeiboMonitor(Star):
         self.cookie_invalid_notified = snapshot["cookie_invalid_notified"]
 
     async def _rollback_persistence_snapshot(
-        self, snapshot: Dict[str, Any], reason: str
+        self, snapshot: dict[str, Any], reason: str
     ) -> bool:
         """恢复运行时旧值，并尽力将旧配置补偿写回框架。"""
         self._restore_persistence_snapshot(snapshot)
@@ -469,9 +470,7 @@ class WeiboMonitor(Star):
             is not None
         )
 
-    def _split_subscription_mapping(
-        self, raw_mapping: Any
-    ) -> Optional[Tuple[str, str]]:
+    def _split_subscription_mapping(self, raw_mapping: Any) -> tuple[str, str] | None:
         """拆分“会话 ID: UID 列表”，允许会话 ID 与微博 URL 中包含冒号。"""
         raw = str(raw_mapping).strip()
         for separator_index in reversed(
@@ -490,7 +489,7 @@ class WeiboMonitor(Star):
                 return session_id, raw_uids
         return None
 
-    def _parse_mapping_for_page(self, raw_mapping: Any) -> Dict[str, Any]:
+    def _parse_mapping_for_page(self, raw_mapping: Any) -> dict[str, Any]:
         """解析一条旧格式映射，保留异常原文供页面提示修复。"""
         raw = str(raw_mapping).strip()
         if not raw:
@@ -544,7 +543,7 @@ class WeiboMonitor(Star):
 
     def _get_delivery_options(
         self, session_id: str, legacy_all: bool = False
-    ) -> Dict[str, bool]:
+    ) -> dict[str, bool]:
         """读取会话的热搜和总结接收设置；旧版 * 配置保持原有全选行为。"""
         options = self.config.get("subscription_delivery_options", {})
         session_options = (
@@ -561,7 +560,7 @@ class WeiboMonitor(Star):
             is True,
         }
 
-    def _get_account_profiles(self) -> Dict[str, Dict[str, Any]]:
+    def _get_account_profiles(self) -> dict[str, dict[str, Any]]:
         """读取博主资料缓存，自动忽略旧版本或损坏的数据。"""
         profiles = self._data.get("account_profiles", {})
         if not isinstance(profiles, dict):
@@ -594,7 +593,7 @@ class WeiboMonitor(Star):
         )
 
     @staticmethod
-    def _optional_profile_bool(value: Any, fallback: Any = None) -> Optional[bool]:
+    def _optional_profile_bool(value: Any, fallback: Any = None) -> bool | None:
         """兼容微博接口可能返回的 bool 或 0/1，同时保留未知状态。"""
         if isinstance(value, bool):
             return value
@@ -712,7 +711,7 @@ class WeiboMonitor(Star):
                 f"WeiboMonitor: UID {profile_uid} 的博主资料缓存保存失败"
             )
 
-    def _get_monitored_account_options(self) -> List[Dict[str, Any]]:
+    def _get_monitored_account_options(self) -> list[dict[str, Any]]:
         """返回带资料缓存的监控 UID，供页面展示头像和昵称。"""
         options = []
         seen_uids = set()
@@ -738,7 +737,7 @@ class WeiboMonitor(Star):
                 )
         return options
 
-    def _normalize_monitored_urls(self, raw_values: Any) -> List[str]:
+    def _normalize_monitored_urls(self, raw_values: Any) -> list[str]:
         """校验页面提交的监控博主，兼容用户名主页链接。"""
         if not isinstance(raw_values, list):
             raise ValueError("monitor_urls 必须是数组")
@@ -763,9 +762,9 @@ class WeiboMonitor(Star):
 
     def _save_subscription_backup(
         self,
-        mappings: List[str],
-        delivery_options: Dict[str, Dict[str, bool]],
-        monitor_urls: List[str],
+        mappings: list[str],
+        delivery_options: dict[str, dict[str, bool]],
+        monitor_urls: list[str],
     ) -> bool:
         """将订阅页面配置写入独立快照，防止插件更新重置框架配置。"""
         self._data["_subscription_page_backup"] = {
@@ -894,7 +893,7 @@ class WeiboMonitor(Star):
         return hashlib.sha256(cookie.encode("utf-8")).hexdigest()
 
     @staticmethod
-    def _parse_notification_targets(value: Any) -> List[str]:
+    def _parse_notification_targets(value: Any) -> list[str]:
         """解析管理通知目标，兼容字符串、列表及逗号分隔格式。"""
         raw_items = value if isinstance(value, list) else [value]
         targets = []
@@ -907,7 +906,7 @@ class WeiboMonitor(Star):
 
     def _get_management_notification_targets(
         self, *, fallback_to_subscriptions: bool
-    ) -> List[str]:
+    ) -> list[str]:
         """返回管理提醒目标；显式目标优先，必要时回退到全部有效订阅会话。"""
         configured = self._parse_notification_targets(
             self._get_config("cookie_notification_target", "")
@@ -918,7 +917,7 @@ class WeiboMonitor(Star):
             return sorted(self._get_all_subscribed_sessions())
         return []
 
-    def _get_weibo_push_readiness(self) -> Dict[str, Any]:
+    def _get_weibo_push_readiness(self) -> dict[str, Any]:
         """统一计算微博动态自动推送就绪状态，不执行网络请求。"""
         cookie = self._get_cookie_value()
         cookie_status = self.cookie_health_status if cookie else "unconfigured"
@@ -1067,8 +1066,8 @@ class WeiboMonitor(Star):
         }
 
     async def _send_text_to_targets(
-        self, targets: List[str], content: str, *, reason: str
-    ) -> Tuple[List[str], List[str]]:
+        self, targets: list[str], content: str, *, reason: str
+    ) -> tuple[list[str], list[str]]:
         """逐目标主动发送文本，并返回成功与失败目标。"""
         successful = []
         failed = []
@@ -1096,7 +1095,7 @@ class WeiboMonitor(Star):
         return timeout
 
     async def _send_message_with_timeout(
-        self, target: str, chain: MessageChain, *, timeout: Optional[int] = None
+        self, target: str, chain: MessageChain, *, timeout: int | None = None
     ):
         """逐目标发送消息，防止单个适配器永久卡住后台任务。"""
         send_timeout = self._get_message_send_timeout() if timeout is None else timeout
@@ -1187,7 +1186,7 @@ class WeiboMonitor(Star):
                 f"WeiboMonitor: 有 {len(failed)} 个目标未收到配置缺口提醒"
             )
 
-    def _get_runtime_status_for_page(self) -> Dict[str, Any]:
+    def _get_runtime_status_for_page(self) -> dict[str, Any]:
         """返回页面所需的最小运行状态，不执行网络请求。"""
         cookie_configured = bool(self._get_cookie_value())
         cookie_status = (
@@ -1228,7 +1227,7 @@ class WeiboMonitor(Star):
             "weibo_readiness": readiness,
         }
 
-    def _build_push_statistics(self, days: int = 7) -> List[Dict[str, Any]]:
+    def _build_push_statistics(self, days: int = 7) -> list[dict[str, Any]]:
         """从每日推送记录中汇总近几天的时段分布和账号排行。"""
         result = []
         now = self._get_utc8_now()
@@ -1237,11 +1236,11 @@ class WeiboMonitor(Star):
             date_str = date.strftime("%Y-%m-%d")
             log_file = self.logs_dir / f"{date.strftime('%Y%m%d')}.log"
             hourly = [0] * 24
-            accounts: Dict[str, int] = {}
+            accounts: dict[str, int] = {}
             total = 0
             if log_file.exists():
                 try:
-                    with open(log_file, "r", encoding="utf-8") as file:
+                    with open(log_file, encoding="utf-8") as file:
                         for line in file:
                             try:
                                 entry = json.loads(line)
@@ -1304,8 +1303,8 @@ class WeiboMonitor(Star):
         except ValueError as e:
             return error_response(str(e), status_code=400)
 
-        serialized: List[str] = []
-        delivery_options: Dict[str, Dict[str, bool]] = {}
+        serialized: list[str] = []
+        delivery_options: dict[str, dict[str, bool]] = {}
         seen_sessions = set()
         for index, row in enumerate(rows, start=1):
             if not isinstance(row, dict):
@@ -1520,7 +1519,7 @@ class WeiboMonitor(Star):
         try:
             # 检查是否已存在相同的记录（避免重复记录）
             if log_file.exists():
-                with open(log_file, "r", encoding="utf-8") as f:
+                with open(log_file, encoding="utf-8") as f:
                     for line in f:
                         try:
                             entry = json.loads(line)
@@ -1534,7 +1533,7 @@ class WeiboMonitor(Star):
         except Exception as e:
             self.plugin_logger.error(f"记录每日日志失败: {e}")
 
-    def _log_hotsearch_to_daily(self, items: List[dict]):
+    def _log_hotsearch_to_daily(self, items: list[dict]):
         """记录热搜推送到每日日志 (JSON 格式)"""
         if not self._get_config("enable_daily_log", False):
             return
@@ -1569,7 +1568,7 @@ class WeiboMonitor(Star):
                 if not log_file.exists():
                     continue
                 try:
-                    with open(log_file, "r", encoding="utf-8") as f:
+                    with open(log_file, encoding="utf-8") as f:
                         for line in f:
                             try:
                                 entry = json.loads(line)
@@ -1630,7 +1629,7 @@ class WeiboMonitor(Star):
         hotsearch_count = 0
         has_any_entry = False
         try:
-            with open(log_file, "r", encoding="utf-8") as f:
+            with open(log_file, encoding="utf-8") as f:
                 for line in f:
                     try:
                         entry = json.loads(line)
@@ -1679,7 +1678,7 @@ class WeiboMonitor(Star):
                     f"发送每日总结到 {target} 失败: {e}。{TARGET_ID_FAILURE_GUIDANCE}"
                 )
 
-    async def _fetch_hotsearch(self) -> List[dict]:
+    async def _fetch_hotsearch(self) -> list[dict]:
         """获取微博热搜榜数据，返回热搜条目列表"""
         try:
             self.plugin_logger.debug("正在获取微博热搜数据...")
@@ -1780,10 +1779,10 @@ class WeiboMonitor(Star):
 
     async def _push_hotsearch(
         self,
-        items: List[dict],
-        targets: List[str],
+        items: list[dict],
+        targets: list[str],
         failure_guidance: str = TARGET_ID_FAILURE_GUIDANCE,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """推送热搜榜到目标会话"""
         if not items:
             self.plugin_logger.debug("热搜条目为空，跳过推送")
@@ -1937,7 +1936,7 @@ class WeiboMonitor(Star):
         """异步持久化迁移后的配置到框架存储。"""
         await self._save_plugin_config_async("配置迁移后")
 
-    def get_targets_legacy(self) -> List[str]:
+    def get_targets_legacy(self) -> list[str]:
         """读取旧版 target_conversation_id 配置（仅用于迁移）"""
         targets_raw = self.config.get("target_conversation_id", [])
         if isinstance(targets_raw, str):
@@ -1954,7 +1953,7 @@ class WeiboMonitor(Star):
                     targets.append(item_str)
         return targets
 
-    def get_headers(self, uid: str = "") -> Dict[str, str]:
+    def get_headers(self, uid: str = "") -> dict[str, str]:
         """获取请求头"""
         cookie = self._get_cookie_value()
         headers = {
@@ -2010,7 +2009,7 @@ class WeiboMonitor(Star):
         self.plugin_logger.info("WeiboMonitor 插件已停止")
 
     @staticmethod
-    def _normalize_inline_image_url(candidate: str) -> Optional[str]:
+    def _normalize_inline_image_url(candidate: str) -> str | None:
         """解析正文中的微博图片跳转链接，并限制为新浪图床地址。"""
         if not isinstance(candidate, str):
             return None
@@ -2040,7 +2039,7 @@ class WeiboMonitor(Star):
         except (TypeError, ValueError):
             return None
 
-    def _extract_inline_image_urls(self, text_html: str) -> List[str]:
+    def _extract_inline_image_urls(self, text_html: str) -> list[str]:
         """提取正文“查看图片”等链接中携带的新浪图床原图。"""
         if not isinstance(text_html, str) or not text_html:
             return []
@@ -2061,8 +2060,8 @@ class WeiboMonitor(Star):
             return []
 
     def _extract_image_urls(
-        self, mblog: dict, text_html: Optional[str] = None
-    ) -> List[str]:
+        self, mblog: dict, text_html: str | None = None
+    ) -> list[str]:
         """从微博图片字段及正文内链中提取高清图片 URL 列表。"""
         image_urls = []
         pics = mblog.get("pics") or []
@@ -2083,7 +2082,7 @@ class WeiboMonitor(Star):
                 image_urls.append(url)
         return image_urls
 
-    def _extract_video_info(self, mblog: dict) -> Optional[dict]:
+    def _extract_video_info(self, mblog: dict) -> dict | None:
         """从微博博文数据中提取视频信息。
         若 page_info.type == "video" 则返回包含 url、cover 等的字典，
         否则返回 None。同时检查转发微博的视频。
@@ -2123,7 +2122,7 @@ class WeiboMonitor(Star):
             "title": page_info.get("page_title"),
         }
 
-    async def _download_image(self, url: str, save_name: str) -> Optional[str]:
+    async def _download_image(self, url: str, save_name: str) -> str | None:
         """下载图片到临时目录，返回本地文件路径"""
         try:
             headers = {
@@ -2164,7 +2163,7 @@ class WeiboMonitor(Star):
         except Exception as e:
             self.plugin_logger.debug(f"清理临时媒体文件出错: {e}")
 
-    async def _download_video(self, url: str, save_name: str) -> Optional[str]:
+    async def _download_video(self, url: str, save_name: str) -> str | None:
         """流式下载视频到临时目录，返回本地文件路径。
         受 max_video_size_mb 限制（0 = 不限制）。
         """
@@ -2226,7 +2225,7 @@ class WeiboMonitor(Star):
             link=post["link"],
         )
 
-    async def _download_post_images(self, post: dict) -> List[str]:
+    async def _download_post_images(self, post: dict) -> list[str]:
         """下载微博图片并返回本地路径列表"""
         image_urls = post.get("image_urls", [])
         max_images = self._get_config("max_images_per_post", 0)
@@ -2253,7 +2252,7 @@ class WeiboMonitor(Star):
                 local_paths.append(local_path)
         return local_paths
 
-    async def _download_post_video(self, post: dict) -> Optional[str]:
+    async def _download_post_video(self, post: dict) -> str | None:
         """下载微博视频并返回本地路径。无视频时返回 None。"""
         video_info = post.get("video_info")
         if not video_info:
@@ -2273,11 +2272,11 @@ class WeiboMonitor(Star):
         self,
         post: dict,
         msg_format: str,
-        targets: List[str],
+        targets: list[str],
         skip_log: bool = False,
         failure_guidance: str = TARGET_ID_FAILURE_GUIDANCE,
         enforce_post_age: bool = False,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """发送单条微博到指定目标。
         文字与图片分别独立发送，解决飞书适配器图文混合消息文字丢失问题（统一应用于所有平台）。
         返回正文和媒体的结构化发送结果，供命令准确展示 X/Y。
@@ -2304,7 +2303,7 @@ class WeiboMonitor(Star):
         if max_images > 0:
             image_urls = image_urls[:max_images]
         image_requested_count = len(image_urls) if image_enabled else 0
-        image_paths: List[str] = []
+        image_paths: list[str] = []
         if image_enabled:
             image_paths = await self._download_post_images(post)
 
@@ -2458,7 +2457,7 @@ class WeiboMonitor(Star):
         }
 
     @staticmethod
-    def _parse_bid_from_url(url: str) -> Optional[Tuple[str, Optional[str]]]:
+    def _parse_bid_from_url(url: str) -> tuple[str, str | None] | None:
         """从微博链接中解析 bid 和可选的 uid。
         支持格式：
         - https://weibo.com/uid/bid
@@ -2479,7 +2478,7 @@ class WeiboMonitor(Star):
             return (match3.group(2), None)
         return None
 
-    async def _fetch_single_weibo(self, bid: str) -> Optional[dict]:
+    async def _fetch_single_weibo(self, bid: str) -> dict | None:
         """通过 bid 抓取单条微博详情，返回 post dict 或 None"""
         try:
             api_url = f"{WEIBO_MOBILE_BASE}/statuses/show?id={bid}"
@@ -2597,7 +2596,7 @@ class WeiboMonitor(Star):
                 uids_str = "*"
             yield (session_id, uids_str)
 
-    def get_targets(self) -> List[str]:
+    def get_targets(self) -> list[str]:
         """返回所有接收全部微博动态的会话。"""
         targets = []
         for session_id, uids_str in self._iter_mappings():
@@ -2605,7 +2604,7 @@ class WeiboMonitor(Star):
                 targets.append(session_id)
         return targets
 
-    def get_delivery_targets(self, delivery_type: str) -> List[str]:
+    def get_delivery_targets(self, delivery_type: str) -> list[str]:
         """返回勾选接收热搜或每日总结的会话，兼容旧版 * 的默认接收规则。"""
         option_key = {
             "hotsearch": "receive_hotsearch",
@@ -2628,7 +2627,7 @@ class WeiboMonitor(Star):
             sessions.add(session_id)
         return sessions
 
-    def _get_targets_for_uid(self, uid: str) -> List[str]:
+    def _get_targets_for_uid(self, uid: str) -> list[str]:
         """返回应接收指定 UID 微博推送的所有会话。
         * 表示接收全部，匹配具体 UID 则只推送给该会话。
         """
@@ -2645,7 +2644,7 @@ class WeiboMonitor(Star):
         return list(targets)
 
     @staticmethod
-    def _resolve_uid_from_config(item: str) -> Optional[str]:
+    def _resolve_uid_from_config(item: str) -> str | None:
         """从配置条目中提取数字 UID，支持纯数字或 URL 格式。"""
         item = item.strip()
         if item.isdigit():
@@ -3013,7 +3012,7 @@ class WeiboMonitor(Star):
     def _format_manual_delivery_message(
         self,
         username: str,
-        delivery: Dict[str, Any],
+        delivery: dict[str, Any],
         current_target: str,
         *,
         has_any_sessions: bool,
@@ -3387,7 +3386,7 @@ class WeiboMonitor(Star):
         hotsearch_count = 0
         has_any_entry = False
         try:
-            with open(log_file, "r", encoding="utf-8") as f:
+            with open(log_file, encoding="utf-8") as f:
                 for line in f:
                     try:
                         entry = json.loads(line)
@@ -3841,7 +3840,7 @@ class WeiboMonitor(Star):
                 self.plugin_logger.info(f"退避 {error_backoff} 秒后重试...")
                 await asyncio.sleep(error_backoff)
 
-    def _parse_urls(self, urls_raw: Any) -> List[str]:
+    def _parse_urls(self, urls_raw: Any) -> list[str]:
         """解析监控URL列表，支持字符串逗号分隔或列表格式"""
         if isinstance(urls_raw, str):
             return [u.strip() for u in urls_raw.split(",") if u.strip()]
@@ -3860,11 +3859,11 @@ class WeiboMonitor(Star):
     def _persist_discovered_posts(
         self,
         uid: str,
-        posts: List[Dict[str, Any]],
-        targets: List[str],
+        posts: list[dict[str, Any]],
+        targets: list[str],
         msg_format: str,
-        cursor_update: Optional[Tuple[str, str]],
-    ) -> List[str]:
+        cursor_update: tuple[str, str] | None,
+    ) -> list[str]:
         """将待投递微博与发现游标一次性落盘，再交给内存队列。"""
         previous_data = copy.deepcopy(self._data)
         pending = self._data.setdefault("_pending_deliveries", {})
@@ -3959,7 +3958,7 @@ class WeiboMonitor(Star):
             if not self._queue_pending_delivery(delivery_id):
                 return
 
-    def _discard_expired_deliveries(self, delivery_ids: List[str]):
+    def _discard_expired_deliveries(self, delivery_ids: list[str]):
         """删除过期待办并落盘；不回退发现游标，也不计入推送统计。"""
         if not delivery_ids:
             return
@@ -3983,7 +3982,7 @@ class WeiboMonitor(Star):
         )
 
     async def _process_monitor_cycle(
-        self, urls: List[str], base_req_interval: int, req_jitter: int, msg_format: str
+        self, urls: list[str], base_req_interval: int, req_jitter: int, msg_format: str
     ):
         for i, url in enumerate(urls):
             try:
@@ -4112,12 +4111,12 @@ class WeiboMonitor(Star):
 
     async def _send_new_posts(
         self,
-        new_posts: List[dict],
-        targets: List[str],
+        new_posts: list[dict],
+        targets: list[str],
         msg_format: str,
-        fallback_target: str = None,
+        fallback_target: str | None = None,
         skip_log: bool = False,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """发送新微博到指定目标（文本与图片分别独立发送，兼容所有平台）"""
         targets = list(dict.fromkeys(targets))
         used_fallback = False
@@ -4164,7 +4163,7 @@ class WeiboMonitor(Star):
             "post_results": post_results,
         }
 
-    async def parse_uid(self, url: str) -> Optional[str]:
+    async def parse_uid(self, url: str) -> str | None:
         """
         解析微博URL或用户名，提取UID。
         支持:
@@ -4211,7 +4210,7 @@ class WeiboMonitor(Star):
                 self.plugin_logger.error(f"WeiboMonitor: 解析用户名 {name} 失败: {e}")
         return None
 
-    async def _fetch_weibo_cards(self, uid: str) -> List[dict]:
+    async def _fetch_weibo_cards(self, uid: str) -> list[dict]:
         """获取指定UID的微博卡片列表"""
         api_url = f"{WEIBO_API_BASE}?type=uid&value={uid}&containerid=107603{uid}"
         try:
@@ -4247,10 +4246,10 @@ class WeiboMonitor(Star):
             return []
 
     def _extract_valid_mblogs(
-        self, cards: List[Dict[str, Any]]
-    ) -> Tuple[List[Dict[str, Any]], str]:
+        self, cards: list[dict[str, Any]]
+    ) -> tuple[list[dict[str, Any]], str]:
         """从卡片列表中提取有效的微博博文，并过滤置顶"""
-        valid_mblogs: List[Dict[str, Any]] = []
+        valid_mblogs: list[dict[str, Any]] = []
         username = "未知用户"
 
         for card in cards:
@@ -4282,7 +4281,7 @@ class WeiboMonitor(Star):
         uid: str,
         force_fetch: bool = False,
         persist_cursor: bool = True,
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """
         检查指定UID的最新微博。
         :param uid: 微博用户ID
@@ -4361,10 +4360,10 @@ class WeiboMonitor(Star):
         self,
         uid: str,
         username: str,
-        valid_mblogs: List[Dict[str, Any]],
+        valid_mblogs: list[dict[str, Any]],
         last_id_key: str,
         old_last_id: int,
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """初始化监控状态，记录起始ID"""
         latest_id_val = valid_mblogs[0].get("id")
         if latest_id_val:
@@ -4409,13 +4408,13 @@ class WeiboMonitor(Star):
     async def _collect_new_posts(
         self,
         uid: str,
-        valid_mblogs: List[Dict[str, Any]],
+        valid_mblogs: list[dict[str, Any]],
         last_id: int,
         force_fetch: bool,
         username: str,
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """收集新的微博帖子，应用屏蔽词过滤、原创/转发过滤"""
-        new_posts: List[Dict[str, Any]] = []
+        new_posts: list[dict[str, Any]] = []
         filter_keywords = self._get_config("filter_keywords", [])
         send_original = self._get_config("send_original", True)
         send_forward = self._get_config("send_forward", True)
@@ -4494,7 +4493,7 @@ class WeiboMonitor(Star):
         return new_posts
 
     def _has_filter_keyword(
-        self, text: str, filter_keywords: List[str], post_id: int
+        self, text: str, filter_keywords: list[str], post_id: int
     ) -> bool:
         """检查文本是否包含屏蔽词"""
         for keyword in filter_keywords:
@@ -4506,7 +4505,7 @@ class WeiboMonitor(Star):
         return False
 
     def _should_skip_by_whitelist(
-        self, text: str, whitelist_keywords: List[str], post_id: int
+        self, text: str, whitelist_keywords: list[str], post_id: int
     ) -> bool:
         """检查文本是否应该被白名单过滤跳过（只有包含白名单关键词才允许推送）"""
         if not whitelist_keywords:
@@ -4523,7 +4522,7 @@ class WeiboMonitor(Star):
         return True
 
     async def _update_last_id(
-        self, valid_mblogs: List[Dict[str, Any]], last_id: int, last_id_key: str
+        self, valid_mblogs: list[dict[str, Any]], last_id: int, last_id_key: str
     ):
         """更新记录的最新微博ID"""
         latest_id_val = valid_mblogs[0].get("id")
