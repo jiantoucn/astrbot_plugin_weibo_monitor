@@ -373,4 +373,4 @@ A: 建议：
 4. 监控账号数量不宜过多
 
 **Q: 在哪里可以找到日志文件？**  
-A: 运行日志请在 AstrBot 管理面板的日志页面查看。自 v1.22.0 起，插件统一使用 AstrBot 提供的日志接口，不再生成独立的 `plugin.log`；旧配置 `enable_plugin_log` 和 `plugin_log_max_size` 仅保留兼容，不再生效。每日推送记录仍保存在 `data/plugin_data/astrbot_plugin_weibo_monitor/logs/YYYYMMDD.log`，每日总结和推送统计继续使用这些记录。
+A: 运行日志请在 AstrBot 管理面板的日志页面查看。自 v1.22.1 起，插件统一使用 AstrBot 提供的日志接口，不再生成独立的 `plugin.log`；旧配置 `enable_plugin_log` 和 `plugin_log_max_size` 仅保留兼容，不再生效。每日推送记录仍保存在 `data/plugin_data/astrbot_plugin_weibo_monitor/logs/YYYYMMDD.log`，每日总结和推送统计继续使用这些记录。
