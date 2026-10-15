@@ -74,10 +74,10 @@
   "logging_settings": {
     "type": "object",
     "description": "日志与每日总结",
-    "hint": "配置运行日志、推送记录和每日统计。",
+    "hint": "运行日志请在 AstrBot 日志面板查看；此处配置每日推送记录和统计。",
     "items": {
-      "enable_plugin_log": {"type": "bool", "default": true, "description": "开启运行日志"},
-      "plugin_log_max_size": {"type": "int", "default": 1, "description": "日志文件最大大小（MB）"},
+      "enable_plugin_log": {"type": "bool", "default": true, "description": "旧版运行日志开关（已停用）", "hint": "仅保留旧配置兼容；运行日志统一由 AstrBot 管理。", "invisible": true},
+      "plugin_log_max_size": {"type": "int", "default": 1, "description": "旧版日志文件大小（已停用）", "hint": "仅保留旧配置兼容；不再生成独立 plugin.log。", "invisible": true},
       "enable_daily_log": {"type": "bool", "default": true, "description": "开启每日推送记录"},
       "enable_daily_summary": {"type": "bool", "default": true, "description": "开启每日发送总结"},
       "daily_summary_time": {"type": "string", "default": "08:00", "description": "每日总结推送时间", "hint": "UTC+8 时间，请使用 HH:MM 格式，例如 20:00。错过设定时间后在当日首次检查时补发。"}
