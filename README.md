@@ -15,11 +15,12 @@
 - **时效过滤**：可设置不推送已发布超过指定分钟数的微博，避免 AstrBot 离线恢复后集中补推。
 - **消息自定义**：支持自定义推送消息格式，满足不同需求。
 - **配置导入导出**：支持配置的导入导出，方便迁移和备份。
-- **管理员保护**：导出、导入和 Cookie 更换命令仅限 AstrBot 全局管理员；管理员 ID 必须在 AstrBot 配置中维护，本插件不提供独立管理员名单。
+- **管理员保护**：导出、导入、Cookie 更换和手动续期命令仅限 AstrBot 全局管理员；管理员 ID 必须在 AstrBot 配置中维护，本插件不提供独立管理员名单。
 - **数据持久化**：自动持久化监控数据，重启后不会重复推送历史微博。
 - **错误恢复**：内置请求重试和异常处理机制；自动微博待投递项会持久化，单个目标超时或失败不会永久卡住其他推送。
 - **运行日志**：统一使用 AstrBot 日志，方便在管理面板排查问题。
 - **Cookie 健康检查**：在抓取前自动检测 Cookie 有效性，失效时会向用户发送一次提醒，避免抓取静默失败。
+- **Cookie 自动续期**：Cookie 中包含 `ALC` 时，可按配置间隔通过新浪 SSO 自动换发新的 `SUB`/`SUBP`；每次刷新会轮换 `ALC`，插件会自动保存新值。`ALC` 失效或过期后仍需手动更新一次 Cookie。
 - **配置完整性提醒**：自动检查 Cookie、监控博主和订阅分组是否齐全；仅配置 Cookie 或仅配置分组时每日最多主动提醒一次，其他缺口也会在状态命令中给出下一步操作。
 - **每日记录与总结**：记录每日推送的微博动态，并定时推送前一天的监控总结。初始化监控时，自动记录历史微博，避免历史微博丢失。
 - **热搜监控**：定时推送微博热搜榜前 N 条（默认无需 Cookie，遇风控自动兜底），支持过滤广告位，间隔和数量可配置。
@@ -45,7 +46,7 @@
 2. **先配置 AstrBot 管理员**：
    在 AstrBot 管理面板的全局设置中填写“管理员 ID”（底层配置项为 `admins_id`），或直接在 AstrBot 全局配置文件中设置 `admins_id`。可在对应平台会话中通过 `/sid` 获取发送者 ID。
    
-   > 请勿在本插件配置中寻找或填写管理员 ID。`/weibo_export`、`/weibo_import`、`/weibo_cookie` 直接使用 AstrBot 全局管理员名单。
+   > 请勿在本插件配置中寻找或填写管理员 ID。`/weibo_export`、`/weibo_import`、`/weibo_cookie`、`/weibo_refresh` 直接使用 AstrBot 全局管理员名单。
 
 3. **获取会话 ID (unified_msg_origin)**：
    在你想接收推送的会话（群聊或私聊）中，向机器人发送指令：
@@ -308,10 +309,11 @@ group_fans_C: 2534531481, 5310078607, https://weibo.com/n/某明星
 
 ## 常用指令
 
-> ⚠️ `/weibo_export`、`/weibo_import`、`/weibo_cookie` 仅对 AstrBot 全局 `admins_id` 中的管理员开放。管理员 ID 必须在 AstrBot 管理面板/全局配置文件中添加，不是在本插件配置中添加。
+> ⚠️ `/weibo_export`、`/weibo_import`、`/weibo_cookie`、`/weibo_refresh` 仅对 AstrBot 全局 `admins_id` 中的管理员开放。管理员 ID 必须在 AstrBot 管理面板/全局配置文件中添加，不是在本插件配置中添加。
 
 - `/weibo_umo`: 获取当前会话 ID（必须在准备接收推送的目标群聊或私聊中执行，只复制命令返回的完整 ID）。
 - `/weibo_verify`: 验证当前设置的 Cookie 是否有效。
+- `/weibo_refresh`（仅 AstrBot 管理员）: 通过 Cookie 中的 `ALC` 立即执行一次 SSO 续期；成功后会更新插件配置和刷新数据，并报告下次自动续期时间。
 - `/weibo_check`: 立即抓取列表里第一个账号并推送最新一条微博；结果按“成功目标数/计划目标数”报告。没有匹配的订阅目标时使用当前会话兜底，并在结果中明确标注。
 - `/weibo_check_all`: 立即抓取列表里所有账号并推送最新一条微博；逐个报告“成功目标数/计划目标数”，不会在正文实际发送失败时误报成功。
 - `/weibo_status`: 查看当前监控状态、微博动态推送是否就绪及 Cookie、监控博主、有效订阅分组等缺失项。
@@ -342,6 +344,19 @@ group_fans_C: 2534531481, 5310078607, https://weibo.com/n/某明星
 - 请勿在多设备同时登录同一账号，可能导致Cookie失效
 - 获取Cookie时请确保使用微博移动端官网 (m.weibo.cn)，而非PC端官网
 - 配置完成后可使用 `/weibo_verify` 指令验证Cookie是否有效
+
+### Cookie 自动续期
+
+如果复制自移动端的 Cookie 中没有 `ALC`，可先在浏览器登录新浪/微博，打开 `https://login.sina.com.cn/sso/test`（404 为正常页面），在开发者工具 `Application → Cookies → login.sina.com.cn` 中复制 `ALC`，再追加到 `weibo_cookie` 末尾。
+
+插件会按“Cookie 自动续期”中的间隔主动刷新，并在 Cookie 健康检查失败时优先尝试刷新：
+
+- 每次 SSO 成功后微博会轮换 `ALC`，插件会立即保存新值
+- `ALC` 默认约 30 天有效，`SUBP` 有效期以微博实际下发为准；建议保持默认 3 天间隔
+- `ALC` 失效或过期后，自动续期会停止并提示手动更新 Cookie
+- 可随时使用 `/weibo_refresh` 手动触发一次续期
+
+自动续期会读写 `data/plugin_data/astrbot_plugin_weibo_monitor/cookie_store.json`，该文件权限固定为 `600`，请勿公开或提交到仓库。
 
 ## 常见问题
 
