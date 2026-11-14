@@ -17,6 +17,15 @@
       "cookie_notification_target": {"type": "string", "default": "", "description": "管理与配置提醒目标", "hint": "可选。请在目标群聊或私聊执行 /weibo_umo，并填写命令返回的完整会话 ID；不要填写平台原始群号或用户号。用于 Cookie 未配置、Cookie 失效或尚未配置订阅分组等管理提醒。"}
     }
   },
+  "cookie_refresh_settings": {
+    "type": "object",
+    "description": "Cookie 自动续期",
+    "hint": "使用 Cookie 中的 ALC 通过新浪 SSO 自动续期。ALC 每次刷新后会轮换；ALC 失效或过期时需要重新获取 Cookie。",
+    "items": {
+      "enable_cookie_refresh": {"type": "bool", "default": true, "description": "开启 Cookie 自动续期", "hint": "仅在 Cookie 中包含 ALC 时生效；没有 ALC 时不会发起刷新请求。"},
+      "cookie_refresh_interval_days": {"type": "int", "default": 3, "description": "主动续期间隔（天）", "hint": "建议 3–5 天；临近 ALC 或 SUBP 过期时会提前刷新。"}
+    }
+  },
   "schedule_settings": {
     "type": "object",
     "description": "监控频率",
@@ -100,6 +109,8 @@
   "weibo_urls": {"type": "list", "item_type": "string", "default": [], "invisible": true},
   "weibo_cookie": {"type": "string", "default": "", "invisible": true},
   "cookie_notification_target": {"type": "string", "default": "", "invisible": true},
+  "enable_cookie_refresh": {"type": "bool", "default": true, "invisible": true},
+  "cookie_refresh_interval_days": {"type": "int", "default": 3, "invisible": true},
   "check_interval": {"type": "int", "default": 10, "invisible": true},
   "check_interval_jitter": {"type": "int", "default": 2, "invisible": true},
   "request_interval": {"type": "int", "default": 5, "invisible": true},

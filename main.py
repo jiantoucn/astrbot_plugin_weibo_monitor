@@ -8,16 +8,21 @@ import os
 import random
 import re
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
+from http.cookies import SimpleCookie
 from typing import Any
 from urllib.parse import parse_qs, quote, urlparse
 
-import astrbot.api.message_components as Comp
 import httpx
+from bs4 import BeautifulSoup
+
+import astrbot.api.message_components as Comp
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, StarTools, register
 from astrbot.api.web import error_response, json_response, request
-from bs4 import BeautifulSoup
+
+from .cookie_refresh import refresh_weibo_cookie
 
 # 常量定义
 DEFAULT_CHECK_INTERVAL = 10  # 默认检查间隔（分钟）
@@ -34,6 +39,10 @@ HOTSEARCH_API_URL = "https://weibo.com/ajax/side/hotSearch"
 DEFAULT_HOTSEARCH_INTERVAL = 60
 DEFAULT_HOTSEARCH_TOP_N = 10
 DEFAULT_HOTSEARCH_TEMPLATE = "🔥 微博热搜榜 Top {top_n}\n⏰ 更新时间: {time}\n\n{items}"
+DEFAULT_COOKIE_REFRESH_INTERVAL_DAYS = 3
+COOKIE_REFRESH_MIN_INTERVAL_SECONDS = 6 * 60 * 60
+COOKIE_REFRESH_ALC_LEAD_SECONDS = 3 * 24 * 60 * 60
+COOKIE_REFRESH_SUBP_LEAD_SECONDS = 2 * 24 * 60 * 60
 PLUGIN_NAME = "astrbot_plugin_weibo_monitor"
 TARGET_ID_FAILURE_GUIDANCE = (
     "💡 请到未收到消息的目标群聊或私聊中执行 /weibo_umo，核对命令返回的完整会话 ID；"
@@ -46,6 +55,10 @@ CURRENT_SESSION_FAILURE_GUIDANCE = (
 
 CONFIG_GROUPS = {
     "account_settings": ("weibo_urls", "weibo_cookie", "cookie_notification_target"),
+    "cookie_refresh_settings": (
+        "enable_cookie_refresh",
+        "cookie_refresh_interval_days",
+    ),
     "schedule_settings": (
         "check_interval",
         "check_interval_jitter",
@@ -110,6 +123,7 @@ class WeiboMonitor(Star):
         self.push_consumer_task: asyncio.Task | None = None
         self._migrate_persist_task: asyncio.Task | None = None
         self.cookie_invalid_notified = False  # cookie 失效是否已通知
+        self._cookie_refresh_lock = asyncio.Lock()
         self.push_queue: asyncio.Queue = asyncio.Queue(maxsize=MAX_PUSH_QUEUE_SIZE)
         self._queued_delivery_ids: set[str] = set()
         self._pending_cursor_updates: dict[str, tuple[str, str]] = {}
@@ -119,6 +133,7 @@ class WeiboMonitor(Star):
         if not self.data_dir.exists():
             self.data_dir.mkdir(parents=True, exist_ok=True)
         self.data_file = self.data_dir / "monitor_data.json"
+        self.cookie_store_file = self.data_dir / "cookie_store.json"
         self.logs_dir = self.data_dir / "logs"
         if not self.logs_dir.exists():
             self.logs_dir.mkdir(parents=True, exist_ok=True)
@@ -127,6 +142,22 @@ class WeiboMonitor(Star):
             self.temp_images_dir.mkdir(parents=True, exist_ok=True)
 
         self._migrate_grouped_config()
+        refresh_group = self.config.get("cookie_refresh_settings")
+        refresh_changed = False
+        if not isinstance(refresh_group, dict):
+            refresh_group = {}
+            self.config["cookie_refresh_settings"] = refresh_group
+            refresh_changed = True
+        if "enable_cookie_refresh" not in refresh_group:
+            refresh_group["enable_cookie_refresh"] = True
+            refresh_changed = True
+        if "cookie_refresh_interval_days" not in refresh_group:
+            refresh_group["cookie_refresh_interval_days"] = (
+                DEFAULT_COOKIE_REFRESH_INTERVAL_DAYS
+            )
+            refresh_changed = True
+        if refresh_changed:
+            self._save_plugin_config("Cookie 自动续期配置初始化")
         self._register_web_apis()
 
         # 配置HTTP客户端，添加重试、超时和连接池设置
@@ -174,6 +205,10 @@ class WeiboMonitor(Star):
 
         # 迁移旧版配置：将 target_conversation_id 合并到 subscription_mappings（同步，确保在 run_monitor 前完成）
         self._migrate_config_v2()
+
+        # 刷新凭证独立保存，避免与监控 Cookie 的域名混在一起。
+        self._cookie_store = self._load_cookie_store()
+        self._reconcile_cookie_store_with_config()
 
         # 检查Cookie是否配置，若框架配置为空则尝试从 _data 兜底恢复
         if not self._get_config("weibo_cookie", ""):
@@ -1160,6 +1195,16 @@ class WeiboMonitor(Star):
             and readiness["blockers"][0]["code"] in paused_codes
         ):
             next_push_label = f"已暂停：{readiness['blockers'][0]['message']}"
+        refresh_store = getattr(self, "_cookie_store", {})
+        cookie_refresh = {
+            "enabled": bool(self._get_config("enable_cookie_refresh", True)),
+            "alc_configured": bool(refresh_store.get("alc")),
+            "alc_invalid": bool(refresh_store.get("alc_invalid")),
+            "last_refresh": str(refresh_store.get("last_refresh_success") or ""),
+            "next_refresh": str(refresh_store.get("next_refresh_at") or ""),
+            "alc_expires_at": str(refresh_store.get("alc_expires_at") or ""),
+            "last_error": str(refresh_store.get("last_refresh_error") or ""),
+        }
         return {
             "last_push_time": self._display_status_time(
                 self._data.get("last_push_time", "")
@@ -1170,6 +1215,7 @@ class WeiboMonitor(Star):
             "cookie_checked_at": self._display_status_time(
                 self.cookie_health_checked_at
             ),
+            "cookie_refresh": cookie_refresh,
             "weibo_readiness": readiness,
         }
 
@@ -1879,9 +1925,9 @@ class WeiboMonitor(Star):
                     targets.append(item_str)
         return targets
 
-    def get_headers(self, uid: str = "") -> dict[str, str]:
-        """获取请求头"""
-        cookie = self._get_cookie_value()
+    def get_headers(self, uid: str = "", cookie: str | None = None) -> dict[str, str]:
+        """获取请求头，可传入候选 Cookie 用于验证新 Cookie。"""
+        cookie = self._get_cookie_value() if cookie is None else cookie.strip()
         headers = {
             "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/604.1",
             "Accept": "application/json, text/plain, */*",
@@ -2712,6 +2758,16 @@ class WeiboMonitor(Star):
                 )
                 return
 
+            if cookie_explicitly_imported or cookie_changed:
+                imported_alc = self._extract_alc(imported_cookie)
+                self._cookie_store["weibo_cn_cookie"] = imported_cookie
+                if imported_alc:
+                    self._cookie_store["alc"] = imported_alc
+                    self._cookie_store["alc_invalid"] = False
+                    self._cookie_store["last_refresh_error"] = ""
+                self._update_next_refresh_time()
+                self._save_cookie_store()
+
             yield event.plain_result(
                 f"✅ 成功导入 {count} 项配置！\n"
                 f"注意：部分配置（如检查间隔）可能需要重启插件后才能完全生效。导入后请先刷新插件后台页面，否则配置无法显示。"
@@ -2780,6 +2836,20 @@ class WeiboMonitor(Star):
             yield event.plain_result(f"⚠️ 暂时无法验证 Cookie: {e}")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("weibo_refresh")
+    async def weibo_refresh(self, event: AstrMessageEvent):
+        """通过 ALC 手动刷新微博 Cookie。"""
+        yield event.plain_result("🔄 正在通过 ALC 刷新微博 Cookie...")
+        success, message = await self._maybe_refresh_cookie(
+            force=True, reason="command"
+        )
+        if success:
+            next_refresh = (self._cookie_store or {}).get("next_refresh_at") or "待定"
+            yield event.plain_result(f"✅ {message}\n下次自动续期：{next_refresh}")
+        else:
+            yield event.plain_result(f"❌ Cookie 续期失败：{message}")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("weibo_cookie")
     async def weibo_cookie(self, event: AstrMessageEvent, cookie: str = ""):
         """更换微博 Cookie 并自动重载插件"""
@@ -2817,6 +2887,15 @@ class WeiboMonitor(Star):
             )
             yield event.plain_result(f"❌ Cookie 未能持久化，{rollback_note}")
             return
+
+        new_alc = self._extract_alc(cookie)
+        self._cookie_store["weibo_cn_cookie"] = cookie
+        if new_alc:
+            self._cookie_store["alc"] = new_alc
+            self._cookie_store["alc_invalid"] = False
+            self._cookie_store["last_refresh_error"] = ""
+        self._update_next_refresh_time()
+        self._save_cookie_store()
 
         backup_saved = self._save_data()
         if backup_saved:
@@ -3202,6 +3281,29 @@ class WeiboMonitor(Star):
         status_lines.append(
             f"- Cookie：{cookie_labels.get(readiness['cookie_status'], '⏳ 待验证')}"
         )
+        refresh_store = getattr(self, "_cookie_store", {})
+        refresh_enabled = self._get_config("enable_cookie_refresh", True)
+        alc_configured = bool(refresh_store.get("alc"))
+        alc_invalid = bool(refresh_store.get("alc_invalid"))
+        alc_label = (
+            "❌ 已失效"
+            if alc_invalid
+            else ("✅ 已配置" if alc_configured else "❌ 未配置")
+        )
+        status_lines.append(
+            f"- Cookie 自动续期：{'✅ 开启' if refresh_enabled else '❌ 关闭'}；ALC：{alc_label}"
+        )
+        if alc_configured:
+            status_lines.append(
+                f"  上次续期：{refresh_store.get('last_refresh_success') or '暂无'}；"
+                f"下次续期：{refresh_store.get('next_refresh_at') or '待定'}"
+            )
+            if refresh_store.get("alc_expires_at"):
+                status_lines.append(f"  ALC 到期：{refresh_store['alc_expires_at']}")
+            if refresh_store.get("last_refresh_error"):
+                status_lines.append(
+                    f"  最近续期错误：{refresh_store['last_refresh_error']}"
+                )
         status_lines.append(
             "- 敏感命令：/weibo_export、/weibo_import、/weibo_cookie 仅 AstrBot "
             "全局管理员可用（请在 AstrBot 的 admins_id/“管理员 ID”中配置，"
@@ -3499,6 +3601,526 @@ class WeiboMonitor(Star):
             return self._save_data()
         return True
 
+    def _load_cookie_store(self) -> dict[str, Any]:
+        """加载 Cookie 刷新数据，并迁移旧的 cookie_store 子目录。"""
+        legacy_file = self.data_dir / "cookie_store" / "cookie_store.json"
+        if not self.cookie_store_file.exists() and legacy_file.exists():
+            try:
+                self.cookie_store_file.write_bytes(legacy_file.read_bytes())
+                os.chmod(self.cookie_store_file, 0o600)
+                logger.info(
+                    "WeiboMonitor: 已迁移 Cookie 刷新数据到 %s", self.cookie_store_file
+                )
+            except OSError as e:
+                logger.warning("WeiboMonitor: 迁移 Cookie 刷新数据失败: %s", e)
+
+        data: dict[str, Any] = {}
+        if self.cookie_store_file.exists():
+            try:
+                loaded = json.loads(self.cookie_store_file.read_text(encoding="utf-8"))
+                if not isinstance(loaded, dict):
+                    raise ValueError("Cookie 刷新数据顶层必须是对象")
+                data = loaded
+            except Exception as e:
+                logger.error("WeiboMonitor: 加载 Cookie 刷新数据失败: %s", e)
+                try:
+                    backup_file = self.cookie_store_file.with_suffix(
+                        f".bak.{int(self._get_utc8_now().timestamp())}"
+                    )
+                    self.cookie_store_file.rename(backup_file)
+                    os.chmod(backup_file, 0o600)
+                except OSError:
+                    pass
+
+        refresh_data = data.get("refresh")
+        refresh_data = refresh_data if isinstance(refresh_data, dict) else {}
+        sina_data = data.get("sina")
+        sina_data = sina_data if isinstance(sina_data, dict) else {}
+        expires_data = refresh_data.get("expires")
+        expires_data = expires_data if isinstance(expires_data, dict) else {}
+
+        def normalize_expiry(raw_value: Any) -> tuple[str, float | None]:
+            if not raw_value:
+                return "", None
+            try:
+                expiry = parsedate_to_datetime(str(raw_value))
+                if expiry.tzinfo is None:
+                    expiry = expiry.replace(tzinfo=timezone.utc)
+                local = expiry.astimezone(timezone(timedelta(hours=8)))
+                return local.strftime("%Y-%m-%d %H:%M:%S"), expiry.timestamp()
+            except (TypeError, ValueError, OverflowError):
+                return "", None
+
+        alc_expires_at = str(data.get("alc_expires_at") or "").strip()
+        alc_expires_ts = data.get("alc_expires_ts")
+        subp_expires_at = str(data.get("subp_expires_at") or "").strip()
+        subp_expires_ts = data.get("subp_expires_ts")
+        if not alc_expires_at or alc_expires_ts is None:
+            legacy_alc_at, legacy_alc_ts = normalize_expiry(expires_data.get("alc"))
+            alc_expires_at = alc_expires_at or legacy_alc_at
+            if alc_expires_ts is None:
+                alc_expires_ts = legacy_alc_ts
+        if not subp_expires_at or subp_expires_ts is None:
+            legacy_subp_at, legacy_subp_ts = normalize_expiry(expires_data.get("subp"))
+            subp_expires_at = subp_expires_at or legacy_subp_at
+            if subp_expires_ts is None:
+                subp_expires_ts = legacy_subp_ts
+        last_success = str(data.get("last_refresh_success") or "").strip()
+        if not last_success:
+            captured_at = self._parse_store_time(str(data.get("captured_at") or ""))
+            if captured_at:
+                last_success = captured_at.strftime("%Y-%m-%d %H:%M:%S")
+        if not last_success:
+            last_success = self._get_utc8_now().strftime("%Y-%m-%d %H:%M:%S")
+
+        store = {
+            "version": 1,
+            "updated_at": str(data.get("updated_at") or "").strip(),
+            "alc": str(data.get("alc") or refresh_data.get("alc") or "").strip(),
+            "alc_expires_at": alc_expires_at,
+            "alc_expires_ts": alc_expires_ts,
+            "sina": {
+                "alf": str(
+                    sina_data.get("alf") or refresh_data.get("sina_alf") or ""
+                ).strip(),
+                "sub": str(
+                    sina_data.get("sub") or refresh_data.get("sina_sub") or ""
+                ).strip(),
+                "subp": str(
+                    sina_data.get("subp") or refresh_data.get("sina_subp") or ""
+                ).strip(),
+                "scf": str(
+                    sina_data.get("scf") or refresh_data.get("sina_scf") or ""
+                ).strip(),
+                "tgc": str(
+                    sina_data.get("tgc") or refresh_data.get("tgc") or ""
+                ).strip(),
+                "lt": str(sina_data.get("lt") or refresh_data.get("lt") or "").strip(),
+            },
+            "weibo_cn_cookie": str(data.get("weibo_cn_cookie") or "").strip(),
+            "weibo_cn": data.get("weibo_cn")
+            if isinstance(data.get("weibo_cn"), dict)
+            else {},
+            "validation": data.get("validation")
+            if isinstance(data.get("validation"), dict)
+            else {},
+            "last_refresh_attempt": str(data.get("last_refresh_attempt") or "").strip(),
+            "last_refresh_success": last_success,
+            "last_refresh_error": str(data.get("last_refresh_error") or "").strip(),
+            "next_refresh_at": str(data.get("next_refresh_at") or "").strip(),
+            "alc_invalid": bool(data.get("alc_invalid")),
+            "subp_expires_at": subp_expires_at,
+            "subp_expires_ts": subp_expires_ts,
+        }
+        self._cookie_store = store
+        self._save_cookie_store()
+        return store
+
+    def _save_cookie_store(self) -> bool:
+        """原子保存 Cookie 刷新数据，文件权限保持 600。"""
+        temp_file = self.cookie_store_file.with_suffix(".tmp")
+        try:
+            self._cookie_store["updated_at"] = self._get_utc8_now().strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+            temp_file.write_text(
+                json.dumps(self._cookie_store, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            os.chmod(temp_file, 0o600)
+            temp_file.replace(self.cookie_store_file)
+            return True
+        except Exception as e:
+            logger.error("WeiboMonitor: 保存 Cookie 刷新数据失败: %s", e)
+            try:
+                if temp_file.exists():
+                    temp_file.unlink()
+            except OSError:
+                pass
+            return False
+
+    @staticmethod
+    def _extract_alc(cookie: str) -> str:
+        """从 Cookie 字符串中提取 ALC，不存在时返回空字符串。"""
+        if not cookie:
+            return ""
+        parsed = SimpleCookie()
+        try:
+            parsed.load(cookie)
+        except Exception:
+            return ""
+        alc = parsed.get("ALC")
+        return alc.value.strip() if alc else ""
+
+    @staticmethod
+    def _alc_timestamp(value: str) -> int:
+        """读取 ALC 中携带的时间戳，用于判断新旧。"""
+        match = re.search(r"-(\d{9,11})-", value or "")
+        return int(match.group(1)) if match else 0
+
+    @staticmethod
+    def _parse_store_time(value: str) -> datetime | None:
+        """解析刷新数据中的 UTC+8 时间字符串。"""
+        if not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(value)
+        except (TypeError, ValueError):
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone(timedelta(hours=8)))
+        return parsed.astimezone(timezone(timedelta(hours=8)))
+
+    def _reconcile_cookie_store_with_config(self):
+        """在启动时同步配置 Cookie 与刷新数据中的 ALC。"""
+        store = self._cookie_store
+        cookie = self._get_cookie_value()
+        if not cookie:
+            stored_cookie = str(store.get("weibo_cn_cookie") or "").strip()
+            if stored_cookie:
+                self._set_config("weibo_cookie", stored_cookie)
+                self._data["_backup_weibo_cookie"] = stored_cookie
+                self._save_data()
+                logger.info("WeiboMonitor: 从 Cookie 刷新数据中恢复了微博 Cookie")
+                cookie = stored_cookie
+            else:
+                self._update_next_refresh_time()
+                self._save_cookie_store()
+                return
+
+        changed = False
+        config_alc = self._extract_alc(cookie)
+        store_alc = str(store.get("alc") or "").strip()
+        if config_alc and (
+            not store_alc
+            or self._alc_timestamp(config_alc) > self._alc_timestamp(store_alc)
+        ):
+            store["alc"] = config_alc
+            store["alc_invalid"] = False
+            store["last_refresh_error"] = ""
+            store["weibo_cn_cookie"] = cookie
+            changed = True
+        elif (
+            store_alc
+            and store.get("weibo_cn_cookie")
+            and self._alc_timestamp(store_alc) > self._alc_timestamp(config_alc)
+        ):
+            stored_cookie = str(store.get("weibo_cn_cookie") or "").strip()
+            if stored_cookie:
+                self._set_config("weibo_cookie", stored_cookie)
+                self._data["_backup_weibo_cookie"] = stored_cookie
+                self._save_data()
+                self._save_plugin_config("Cookie 刷新数据恢复")
+                logger.warning(
+                    "WeiboMonitor: 检测到刷新数据中的 Cookie 更新，已恢复较新的 Cookie"
+                )
+                cookie = stored_cookie
+                changed = True
+
+        if not str((store.get("sina") or {}).get("alf") or "").strip():
+            parsed = SimpleCookie()
+            try:
+                parsed.load(cookie)
+            except Exception:
+                parsed = SimpleCookie()
+            alf = parsed.get("ALF")
+            if alf:
+                store.setdefault("sina", {})["alf"] = alf.value.strip()
+                changed = True
+
+        if not str(store.get("weibo_cn_cookie") or "").strip():
+            store["weibo_cn_cookie"] = cookie
+            changed = True
+
+        self._update_next_refresh_time()
+        if changed:
+            self._save_cookie_store()
+
+    def _update_next_refresh_time(self):
+        """根据间隔和 ALC/SUBP 到期时间计算下次续期时间。"""
+        store = self._cookie_store
+        if store.get("alc_invalid"):
+            store["next_refresh_at"] = ""
+            return
+        try:
+            interval_days = int(
+                self._get_config(
+                    "cookie_refresh_interval_days",
+                    DEFAULT_COOKIE_REFRESH_INTERVAL_DAYS,
+                )
+            )
+        except (TypeError, ValueError):
+            interval_days = DEFAULT_COOKIE_REFRESH_INTERVAL_DAYS
+        interval_days = max(1, min(30, interval_days))
+
+        now = self._get_utc8_now()
+        candidates = []
+        last_success = self._parse_store_time(
+            str(store.get("last_refresh_success") or "")
+        )
+        if last_success:
+            candidates.append(last_success + timedelta(days=interval_days))
+        alc_expires_ts = store.get("alc_expires_ts")
+        if alc_expires_ts:
+            candidates.append(
+                datetime.fromtimestamp(float(alc_expires_ts), now.tzinfo)
+                - timedelta(seconds=COOKIE_REFRESH_ALC_LEAD_SECONDS)
+            )
+        subp_expires_ts = store.get("subp_expires_ts")
+        if subp_expires_ts:
+            candidates.append(
+                datetime.fromtimestamp(float(subp_expires_ts), now.tzinfo)
+                - timedelta(seconds=COOKIE_REFRESH_SUBP_LEAD_SECONDS)
+            )
+        if not candidates:
+            store["next_refresh_at"] = ""
+            return
+        next_refresh = min(candidates)
+        if next_refresh < now:
+            next_refresh = now
+        store["next_refresh_at"] = next_refresh.strftime("%Y-%m-%d %H:%M:%S")
+
+    def _cookie_refresh_due(self) -> bool:
+        """判断当前是否满足自动续期条件。"""
+        store = self._cookie_store
+        if not self._get_config("enable_cookie_refresh", True):
+            return False
+        if not str(store.get("alc") or "").strip():
+            return False
+        if store.get("alc_invalid"):
+            return False
+
+        now = self._get_utc8_now()
+        last_attempt = self._parse_store_time(
+            str(store.get("last_refresh_attempt") or "")
+        )
+        if (
+            last_attempt
+            and (now - last_attempt).total_seconds()
+            < COOKIE_REFRESH_MIN_INTERVAL_SECONDS
+        ):
+            return False
+
+        try:
+            interval_days = int(
+                self._get_config(
+                    "cookie_refresh_interval_days",
+                    DEFAULT_COOKIE_REFRESH_INTERVAL_DAYS,
+                )
+            )
+        except (TypeError, ValueError):
+            interval_days = DEFAULT_COOKIE_REFRESH_INTERVAL_DAYS
+        interval_days = max(1, min(30, interval_days))
+
+        last_success = self._parse_store_time(
+            str(store.get("last_refresh_success") or "")
+        )
+        if not last_success or now >= last_success + timedelta(days=interval_days):
+            return True
+
+        alc_expires_ts = store.get("alc_expires_ts")
+        if (
+            alc_expires_ts
+            and now.timestamp()
+            >= float(alc_expires_ts) - COOKIE_REFRESH_ALC_LEAD_SECONDS
+        ):
+            return True
+        subp_expires_ts = store.get("subp_expires_ts")
+        return bool(
+            subp_expires_ts
+            and now.timestamp()
+            >= float(subp_expires_ts) - COOKIE_REFRESH_SUBP_LEAD_SECONDS
+        )
+
+    async def _validate_cookie_value(self, cookie: str) -> tuple[bool, bool]:
+        """验证候选 Cookie 的登录状态，并在可用时检查微博列表接口。"""
+        try:
+            response = await self.client.get(
+                f"{WEIBO_MOBILE_BASE}/api/config",
+                headers=self.get_headers(cookie=cookie),
+            )
+            if response.status_code != 200:
+                return False, False
+            data = response.json().get("data") or {}
+            if data.get("login") is not True:
+                return False, False
+
+            uid = str(data.get("uid") or "").strip()
+            if not uid:
+                for raw_url in self._parse_urls(self._get_config("weibo_urls", [])):
+                    resolved = self._resolve_uid_from_config(raw_url)
+                    if resolved:
+                        uid = resolved
+                        break
+            if not uid:
+                return True, False
+
+            feed_response = await self.client.get(
+                f"{WEIBO_API_BASE}?type=uid&value={uid}&containerid=107603{uid}",
+                headers=self.get_headers(uid=uid, cookie=cookie),
+            )
+            if feed_response.status_code != 200:
+                return True, False
+            return True, feed_response.json().get("ok") == 1
+        except Exception as e:
+            logger.debug("WeiboMonitor: 验证续期 Cookie 失败: %s", e)
+            return False, False
+
+    async def _maybe_refresh_cookie(
+        self, *, force: bool = False, reason: str = "schedule"
+    ) -> tuple[bool, str]:
+        """按需通过 ALC 刷新 Cookie，并立即持久化轮换后的凭证。"""
+        if not force and not self._get_config("enable_cookie_refresh", True):
+            return False, "自动续期未开启"
+        store = self._cookie_store
+        alc = str(store.get("alc") or "").strip()
+        if not alc:
+            return False, "未配置 ALC"
+        if not force and store.get("alc_invalid"):
+            return False, "ALC 已失效，等待手动更新 Cookie"
+        if not force and not self._cookie_refresh_due():
+            return False, "未到续期时间"
+        if self._cookie_refresh_lock.locked():
+            return False, "已有续期任务在进行"
+
+        async with self._cookie_refresh_lock:
+            now = self._get_utc8_now()
+            now_text = now.strftime("%Y-%m-%d %H:%M:%S")
+            store["last_refresh_attempt"] = now_text
+            store["last_refresh_error"] = ""
+            self._save_cookie_store()
+
+            alf = str((store.get("sina") or {}).get("alf") or "").strip()
+            try:
+                result = await refresh_weibo_cookie(self.client, alc, alf)
+            except Exception as error:
+                result = {
+                    "ok": False,
+                    "error_code": "network_error",
+                    "error": f"{type(error).__name__}: {error}",
+                    "alc": alc,
+                }
+
+            new_alc = str(result.get("alc") or "").strip()
+            if new_alc:
+                store["alc"] = new_alc
+            sina_result = result.get("sina") or {}
+            for source_key, target_key in (
+                ("ALF", "alf"),
+                ("SUB", "sub"),
+                ("SUBP", "subp"),
+                ("SCF", "scf"),
+                ("tgc", "tgc"),
+                ("LT", "lt"),
+            ):
+                value = str(sina_result.get(source_key) or "").strip()
+                if value:
+                    store.setdefault("sina", {})[target_key] = value
+            if result.get("alc_expires_at"):
+                store["alc_expires_at"] = str(result["alc_expires_at"])
+                store["alc_expires_ts"] = result.get("alc_expires_ts")
+            if result.get("subp_expires_at"):
+                store["subp_expires_at"] = str(result["subp_expires_at"])
+                store["subp_expires_ts"] = result.get("subp_expires_ts")
+
+            if not result.get("ok"):
+                error_message = str(result.get("error") or "续期失败")
+                store["last_refresh_error"] = error_message
+                if result.get("error_code") == "alc_invalid":
+                    store["alc_invalid"] = True
+                    store["next_refresh_at"] = ""
+                else:
+                    store["next_refresh_at"] = (
+                        now + timedelta(seconds=COOKIE_REFRESH_MIN_INTERVAL_SECONDS)
+                    ).strftime("%Y-%m-%d %H:%M:%S")
+                self._save_cookie_store()
+                logger.warning(
+                    "WeiboMonitor: Cookie 自动续期失败（%s）: %s",
+                    reason,
+                    error_message,
+                )
+                return False, error_message
+
+            candidate = str(result.get("weibo_cn_cookie") or "").strip()
+            if not candidate:
+                error_message = "续期未返回有效 Cookie"
+                store["last_refresh_error"] = error_message
+                self._save_cookie_store()
+                return False, error_message
+
+            try:
+                candidate_parsed = SimpleCookie()
+                candidate_parsed.load(candidate)
+                current_parsed = SimpleCookie()
+                current_parsed.load(self._get_cookie_value())
+            except Exception:
+                candidate_parsed = SimpleCookie()
+                current_parsed = SimpleCookie()
+
+            merged = {name: item.value for name, item in candidate_parsed.items()}
+            for name in (
+                "XSRF-TOKEN",
+                "MLOGIN",
+                "M_WEIBOCN_PARAMS",
+                "_T_WM",
+                "WEIBOCN_FROM",
+                "mweibo_short_token",
+            ):
+                if name not in merged and name in current_parsed:
+                    merged[name] = current_parsed[name].value
+            if new_alc:
+                merged["ALC"] = new_alc
+            candidate = "; ".join(f"{name}={value}" for name, value in merged.items())
+
+            login, feed_ok = await self._validate_cookie_value(candidate)
+            store["validation"] = {
+                "login": login,
+                "feed_api_ok": feed_ok,
+                "checked_at": now_text,
+            }
+            if not login:
+                error_message = "续期后的 Cookie 验证失败"
+                store["last_refresh_error"] = error_message
+                store["next_refresh_at"] = (
+                    now + timedelta(seconds=COOKIE_REFRESH_MIN_INTERVAL_SECONDS)
+                ).strftime("%Y-%m-%d %H:%M:%S")
+                self._save_cookie_store()
+                logger.warning("WeiboMonitor: %s，已保留旧 Cookie", error_message)
+                return False, error_message
+
+            # 先更新运行中的配置，后续请求会立即使用新 Cookie。
+            self._set_config("weibo_cookie", candidate)
+            self._data["_backup_weibo_cookie"] = candidate
+            self.cookie_invalid_notified = False
+            self._set_cookie_health_status("valid")
+
+            store["weibo_cn_cookie"] = candidate
+            store["weibo_cn"] = result.get("weibo_cn") or {}
+            store["last_refresh_success"] = now_text
+            store["last_refresh_error"] = ""
+            store["alc_invalid"] = False
+            self._update_next_refresh_time()
+            self._save_cookie_store()
+
+            config_saved = await self._save_plugin_config_async("Cookie 自动续期")
+            data_saved = self._save_data()
+            if not config_saved:
+                logger.warning(
+                    "WeiboMonitor: Cookie 已续期，但框架配置保存失败；"
+                    "当前运行继续使用新 Cookie，刷新数据已保留"
+                )
+            if not data_saved:
+                logger.warning("WeiboMonitor: Cookie 已续期，但插件数据保存失败")
+
+            alc_expires = str(store.get("alc_expires_at") or "未知")
+            logger.info(
+                "WeiboMonitor: Cookie 自动续期成功（%s），ALC 到期: %s，下次续期: %s",
+                reason,
+                alc_expires,
+                store.get("next_refresh_at") or "待定",
+            )
+            return True, f"Cookie 已续期，ALC 到期：{alc_expires}"
+
     async def run_monitor(self):
         """后台监控主循环"""
         logger.info("微博监控任务已启动")
@@ -3521,6 +4143,21 @@ class WeiboMonitor(Star):
                     logger.warning(
                         f"WeiboMonitor: 发送配置缺口提醒失败: {reminder_error}"
                     )
+
+                try:
+                    refreshed, refresh_message = await self._maybe_refresh_cookie()
+                    if refreshed:
+                        logger.info(f"WeiboMonitor: {refresh_message}")
+                    elif refresh_message not in {
+                        "未到续期时间",
+                        "自动续期未开启",
+                        "未配置 ALC",
+                        "ALC 已失效，等待手动更新 Cookie",
+                        "已有续期任务在进行",
+                    }:
+                        logger.debug(f"WeiboMonitor: 自动续期未执行: {refresh_message}")
+                except Exception as refresh_error:
+                    logger.warning(f"WeiboMonitor: 自动续期检查失败: {refresh_error}")
 
                 retention = self._get_config("temp_media_retention_minutes", 10)
                 if retention > 0:
@@ -3621,6 +4258,18 @@ class WeiboMonitor(Star):
                     else:
                         # 检查 Cookie 健康
                         cookie_health_status = await self._check_cookie_health()
+                        refresh_message = ""
+                        if cookie_health_status != "valid" and self._get_config(
+                            "enable_cookie_refresh", True
+                        ):
+                            (
+                                refreshed,
+                                refresh_message,
+                            ) = await self._maybe_refresh_cookie(
+                                force=True, reason="health_check"
+                            )
+                            if refreshed:
+                                cookie_health_status = "valid"
                         self._set_cookie_health_status(cookie_health_status)
                         if cookie_health_status != "valid":
                             if cookie_health_status == "invalid":
@@ -3630,12 +4279,18 @@ class WeiboMonitor(Star):
                                             fallback_to_subscriptions=True
                                         )
                                     )
+                                    refresh_note = (
+                                        f"\n自动续期失败：{refresh_message}"
+                                        if refresh_message
+                                        else ""
+                                    )
                                     (
                                         successful,
                                         failed,
                                     ) = await self._send_text_to_targets(
                                         notify_targets,
-                                        "⚠️ 微博监控 Cookie 失效提醒：已配置的微博 Cookie 验证为未登录或已失效，微博动态自动监控已暂停。\n请重新获取 Cookie，更新后使用 /weibo_verify 验证。",
+                                        "⚠️ 微博监控 Cookie 失效提醒：已配置的微博 Cookie 验证为未登录或已失效，微博动态自动监控已暂停。\n请重新获取 Cookie，更新后使用 /weibo_verify 验证。"
+                                        + refresh_note,
                                         reason="Cookie 失效通知",
                                     )
                                     if successful:
